@@ -172,7 +172,11 @@ async def reminder_loop(app: Application) -> None:
     digest_sent_today: str = ""  # track date string so we only send once
 
     while True:
-        await asyncio.sleep(60)
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            logger.info("Reminder loop cancelled.")
+            return
         try:
             from datetime import datetime
             from zoneinfo import ZoneInfo
@@ -207,10 +211,27 @@ async def reminder_loop(app: Application) -> None:
             logger.error(f"Reminder loop error: {e}")
 
 
+# Keep a reference so we can cancel it cleanly on shutdown
+_reminder_task: asyncio.Task | None = None
+
+
 async def on_startup(app: Application) -> None:
     """Called once after the bot initialises — starts background tasks."""
-    asyncio.create_task(reminder_loop(app))
+    global _reminder_task
+    _reminder_task = asyncio.create_task(reminder_loop(app))
     logger.info("Reminder loop started ✓")
+
+
+async def on_shutdown(app: Application) -> None:
+    """Cancel background tasks cleanly so asyncio doesn't complain."""
+    global _reminder_task
+    if _reminder_task and not _reminder_task.done():
+        _reminder_task.cancel()
+        try:
+            await _reminder_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Reminder loop stopped ✓")
 
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
@@ -536,7 +557,7 @@ def main():
     logger.info("Database ready ✓")
 
     # Build the bot
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(on_startup).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(on_startup).post_shutdown(on_shutdown).build()
 
     # Register command handlers
     app.add_handler(CommandHandler("start",   cmd_start))

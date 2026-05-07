@@ -288,11 +288,12 @@ def get_exchange_rate(from_currency: str, to_currency: str) -> str:
     """Live exchange rate between two currencies (e.g. USD to LKR)."""
     from_c = from_currency.upper().strip()
     to_c   = to_currency.upper().strip()
-    data = _get("https://api.frankfurter.app/latest", **{"from": from_c, "to": to_c})
-    if not data or "rates" not in data:
+    # open.er-api.com covers 170+ currencies including LKR — no key needed
+    data = _get(f"https://open.er-api.com/v6/latest/{from_c}")
+    if not data or data.get("result") != "success":
         return f"Couldn't fetch exchange rate for {from_c} → {to_c}."
-    rate = data["rates"].get(to_c)
+    rate = data.get("rates", {}).get(to_c)
     if rate is None:
         return f"Currency '{to_c}' not found."
-    date = data.get("date", "")
+    date = data.get("time_last_update_utc", "")[:16]
     return f"1 {from_c} = {rate} {to_c}  (as of {date})"

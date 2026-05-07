@@ -25,7 +25,12 @@ from telegram.ext import (
 from telegram.constants import ChatAction
 
 from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID
-from memory import init_db, get_all_facts, clear_history, clear_all, get_open_threads, close_thread
+from memory import (
+    init_db, get_all_facts, clear_history, clear_all,
+    get_open_threads, close_thread,
+    get_due_reminders, mark_reminder_sent,
+    save_setting, get_setting,
+)
 from brain import chat
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -76,6 +81,47 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Unhandled exception: {err}", exc_info=err)
 
 
+# ── Sinhala detection ────────────────────────────────────────────────────────
+
+def is_sinhala(text: str) -> bool:
+    """True if the text contains Sinhala Unicode characters (U+0D80–U+0DFF)."""
+    return any('඀' <= c <= '෿' for c in text)
+
+
+# ── Reminder background loop ──────────────────────────────────────────────────
+
+async def reminder_loop(app: Application) -> None:
+    """
+    Runs every 60 seconds. Fires any reminders whose remind_at has passed
+    and sends them directly to the user's Telegram chat.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            chat_id = get_setting("chat_id")
+            if not chat_id:
+                continue  # No messages yet — don't know where to send
+            due = get_due_reminders()
+            for r in due:
+                try:
+                    await app.bot.send_message(
+                        chat_id=int(chat_id),
+                        text=f"⏰ hey! reminder: {r['message']} 🩷"
+                    )
+                    mark_reminder_sent(r["id"])
+                    logger.info(f"Reminder sent: {r['message']}")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder #{r['id']}: {e}")
+        except Exception as e:
+            logger.error(f"Reminder loop error: {e}")
+
+
+async def on_startup(app: Application) -> None:
+    """Called once after the bot initialises — starts background tasks."""
+    asyncio.create_task(reminder_loop(app))
+    logger.info("Reminder loop started ✓")
+
+
 # ── Auth helper ───────────────────────────────────────────────────────────────
 
 def is_authorized(update: Update) -> bool:
@@ -99,13 +145,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+    # Persist chat_id so the reminder loop knows where to send proactive messages
+    save_setting("chat_id", str(update.effective_chat.id))
+
+    # ── Sinhala translation pipeline ─────────────────────────────────────────
+    sinhala_mode = is_sinhala(user_text)
+    if sinhala_mode:
+        from tools import translate_to_english, translate_to_sinhala
+        english_text = await asyncio.to_thread(translate_to_english, user_text)
+    else:
+        english_text = user_text
+
     # Show typing indicator while we wait for Claude
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=ChatAction.TYPING
     )
 
-    response = await chat(user_text)
+    response = await chat(english_text)
+
+    if sinhala_mode:
+        response = await asyncio.to_thread(translate_to_sinhala, response)
+
     await safe_reply(update, response)
 
 
@@ -229,7 +290,7 @@ def main():
     logger.info("Database ready ✓")
 
     # Build the bot
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(on_startup).build()
 
     # Register command handlers
     app.add_handler(CommandHandler("start",   cmd_start))

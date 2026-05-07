@@ -297,3 +297,23 @@ def get_exchange_rate(from_currency: str, to_currency: str) -> str:
         return f"Currency '{to_c}' not found."
     date = data.get("time_last_update_utc", "")[:16]
     return f"1 {from_c} = {rate} {to_c}  (as of {date})"
+
+
+# ── Translation (Sinhala ↔ English) ──────────────────────────────────────────
+
+def translate_to_english(text: str) -> str:
+    """Translate Sinhala text to English using Google Translate."""
+    try:
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="si", target="en").translate(text) or text
+    except Exception as e:
+        return text  # Fall back to original — brain handles it as-is
+
+
+def translate_to_sinhala(text: str) -> str:
+    """Translate English text to Sinhala using Google Translate."""
+    try:
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="en", target="si").translate(text) or text
+    except Exception as e:
+        return text  # Fall back to English — still readable

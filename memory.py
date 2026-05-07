@@ -83,6 +83,21 @@ def init_db():
                 updated_at TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                message    TEXT    NOT NULL,
+                remind_at  TEXT    NOT NULL,
+                sent       INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         conn.commit()
     try:
         _init_vector_db()
@@ -233,6 +248,67 @@ def get_open_threads() -> list[dict]:
             "SELECT id, summary, created_at FROM threads WHERE status='open' ORDER BY id DESC"
         )
         return [{"id": r[0], "summary": r[1], "created_at": r[2]} for r in cursor.fetchall()]
+
+
+# ── Reminders ────────────────────────────────────────────────────────────────
+
+def set_reminder(message: str, remind_at: str) -> str:
+    """Save a reminder. remind_at is ISO datetime in Sri Lanka local time."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        # Normalise format: accept "YYYY-MM-DD HH:MM" or "YYYY-MM-DDTHH:MM:SS"
+        remind_at = remind_at.strip().replace(" ", "T")
+        if len(remind_at) == 16:
+            remind_at += ":00"
+        # Sanity-check it's parseable
+        datetime.fromisoformat(remind_at)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO reminders (message, remind_at) VALUES (?, ?)",
+                (message, remind_at)
+            )
+            conn.commit()
+        display = remind_at.replace("T", " ")
+        return f"Reminder set for {display} (Sri Lanka time): {message}"
+    except Exception as e:
+        return f"Couldn't set reminder: {e}"
+
+
+def get_due_reminders() -> list[dict]:
+    """Return all unsent reminders whose remind_at has passed."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Colombo")).strftime("%Y-%m-%dT%H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT id, message, remind_at FROM reminders WHERE sent=0 AND remind_at <= ?",
+            (now,)
+        )
+        return [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in cursor.fetchall()]
+
+
+def mark_reminder_sent(reminder_id: int):
+    """Mark a reminder as delivered."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE reminders SET sent=1 WHERE id=?", (reminder_id,))
+        conn.commit()
+
+
+# ── Settings (key-value store) ────────────────────────────────────────────────
+
+def save_setting(key: str, value: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+        )
+        conn.commit()
+
+
+def get_setting(key: str) -> str | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 # ── Conversation history ──────────────────────────────────────────────────────

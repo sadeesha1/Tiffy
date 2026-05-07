@@ -65,7 +65,7 @@ check("get_movie(Interstellar)",        lambda: get_movie("Interstellar"))
 # ── Brain ─────────────────────────────────────────────────────────────────────
 check("brain imports",                  lambda: __import__("brain"))
 check("brain.build_system() — 2 blocks", lambda: len(__import__("brain").build_system()) == 2)
-check("brain.TOOLS — 15 tools",         lambda: len(__import__("brain").TOOLS) == 15)
+check("brain.TOOLS — 16 tools",         lambda: len(__import__("brain").TOOLS) == 16)
 check("brain has asyncio.to_thread",    lambda: "asyncio.to_thread" in open("brain.py", encoding="utf-8").read())
 
 # ── Print results ─────────────────────────────────────────────────────────────

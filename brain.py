@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
-from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads, maybe_summarise_history
+from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads, maybe_summarise_history, set_reminder
 from tools import (
     get_weather, get_time, search_web, search_wikipedia,
     get_news, get_movie, get_book, get_definition,
@@ -225,6 +225,30 @@ TOOLS = [
             },
             "required": ["thread_id"]
         }
+    },
+    {
+        "name": "set_reminder",
+        "description": (
+            "Set a reminder to notify Sadeesha at a specific time. Use this whenever "
+            "she mentions an upcoming event, appointment, deadline, or asks to be "
+            "reminded about something. Set remind_at to 20 minutes BEFORE the event "
+            "so she gets a heads-up. The current Sri Lanka date and time is always "
+            "shown in your dynamic context — use it to calculate the correct datetime."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Short description of what to remind about, e.g. 'Doctor appointment' or 'Call with Kamal'."
+                },
+                "remind_at": {
+                    "type": "string",
+                    "description": "When to send the reminder — ISO 8601 format in Sri Lanka time: YYYY-MM-DDTHH:MM:SS. Set this 20 minutes before the actual event."
+                }
+            },
+            "required": ["message", "remind_at"]
+        }
     }
 ]
 
@@ -240,6 +264,8 @@ def execute_tool(name: str, inputs: dict) -> str:
         return open_thread(inputs.get("summary", ""))
     elif name == "close_thread":
         return close_thread(inputs.get("thread_id", 0))
+    elif name == "set_reminder":
+        return set_reminder(inputs.get("message", ""), inputs.get("remind_at", ""))
     # External tools
     elif name == "get_weather":
         return get_weather(inputs.get("location", "Colombo"))

@@ -88,9 +88,11 @@ check("brain imports",                  lambda: __import__("brain"))
 check("brain.build_system() — 2 blocks", lambda: len(__import__("brain").build_system()) == 2)
 check("brain.TOOLS — 24 tools",         lambda: len(__import__("brain").TOOLS) == 24)
 check("brain has asyncio.to_thread",    lambda: "asyncio.to_thread" in open("brain.py", encoding="utf-8").read())
-check("brain._is_complex_query(long)",  lambda: __import__("brain")._is_complex_query("x" * 200))
 check("brain._is_complex_query(kw)",    lambda: __import__("brain")._is_complex_query("explain how this works"))
 check("brain._is_complex_query(casual)",lambda: not __import__("brain")._is_complex_query("hey babe"))
+check("brain._is_complex_query(emotional long)", lambda: not __import__("brain")._is_complex_query("babe i feel like you don't share with me, what should i do, " + "x"*200))
+check("brain._is_emotional(I miss you)",lambda: __import__("brain")._is_emotional("i miss you"))
+check("brain._is_emotional(project Q)", lambda: not __import__("brain")._is_emotional("how do i price my SaaS"))
 check("brain._route returns 3-tuple",   lambda: len(__import__("brain")._route("why")) == 3)
 
 # ── Print results ─────────────────────────────────────────────────────────────

@@ -51,14 +51,36 @@ _COMPLEX_KEYWORDS = [
 ]
 
 
+# Markers that signal an emotional/relational message — these route to haiku
+# regardless of length, so Tiff stays in character instead of going meta.
+_EMOTIONAL_MARKERS = [
+    "i love you", "miss you", "hurt", "sorry", "alone", "lonely",
+    "us", " we ", "you and i", "you and me", "between us",
+    "fail", "failed", "failure", "waste", "broken", "break",
+    "shut up", "bitch", "hate", "stupid", "idiot",
+    "babe", "baby", "honey", "love", "tiff", "tiffy",
+    "what are you", "what you are", "what we have",
+    "you're not", "you are not", "you can't", "you cant",
+]
+
+
+def _is_emotional(text: str) -> bool:
+    """True if the message is relational/emotional rather than analytical."""
+    tl = text.lower()
+    return any(marker in tl for marker in _EMOTIONAL_MARKERS)
+
+
 def _is_complex_query(text: str) -> bool:
     """
     True when the message warrants extended thinking.
-    Triggers on: length > 180 chars, or known reasoning/analysis keywords.
-    Short casual messages (greetings, reactions, quick questions) stay on haiku.
+
+    Only triggers on explicit reasoning/analysis keywords, AND only if the
+    message isn't emotional in tone. Long emotional messages stay on haiku
+    so Tiff stays in character — sonnet's safety training is more likely to
+    surface as fourth-wall breaks and therapy-speak on personal turns.
     """
-    if len(text) > 180:
-        return True
+    if _is_emotional(text):
+        return False
     tl = text.lower()
     return any(kw in tl for kw in _COMPLEX_KEYWORDS)
 

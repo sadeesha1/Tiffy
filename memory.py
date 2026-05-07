@@ -539,10 +539,10 @@ def maybe_summarise_history() -> bool:
 
     try:
         import anthropic
-        from config import ANTHROPIC_API_KEY, MODEL
+        from config import ANTHROPIC_API_KEY, FAST_MODEL
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         resp = client.messages.create(
-            model=MODEL,
+            model=FAST_MODEL,
             max_tokens=512,
             messages=[{
                 "role": "user",

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, MODEL, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
+from config import ANTHROPIC_API_KEY, MODEL, FAST_MODEL, THINKING_BUDGET, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
 from memory import (
     remember, recall, save_message, get_history, get_all_facts,
     open_thread, close_thread, get_open_threads, maybe_summarise_history,
@@ -34,6 +34,46 @@ logger = logging.getLogger(__name__)
 
 # Async Anthropic client
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# ── Query complexity routing ──────────────────────────────────────────────────
+
+# Keywords that signal the user wants deep thinking, not a quick reply
+_COMPLEX_KEYWORDS = [
+    "why", "how does", "how do", "explain", "analyze", "analyse",
+    "compare", "difference between", "what do you think", "your opinion",
+    "should i", "help me decide", "is it worth", "better option",
+    "pros and cons", "strategy", "plan", "advice", "figure out",
+    "make sense of", "what would you", "what if", "break down",
+    "walk me through", "help me understand", "critique", "review",
+    "evaluate", "what's wrong", "why isn't", "how can i improve",
+    "think about", "thoughts on", "feedback on",
+]
+
+
+def _is_complex_query(text: str) -> bool:
+    """
+    True when the message warrants extended thinking.
+    Triggers on: length > 180 chars, or known reasoning/analysis keywords.
+    Short casual messages (greetings, reactions, quick questions) stay on haiku.
+    """
+    if len(text) > 180:
+        return True
+    tl = text.lower()
+    return any(kw in tl for kw in _COMPLEX_KEYWORDS)
+
+
+def _route(user_text: str) -> tuple[str, dict | None, int]:
+    """
+    Return (model, thinking_config, max_tokens) for this message.
+
+    Complex queries → sonnet + extended thinking.
+    Casual messages → haiku, no thinking, capped tokens (faster + cheaper).
+    """
+    if _is_complex_query(user_text) and THINKING_BUDGET > 0:
+        thinking = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
+        return MODEL, thinking, THINKING_BUDGET + 2048
+    return FAST_MODEL, None, 768
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -457,7 +497,7 @@ def execute_tool(name: str, inputs: dict) -> str:
 
 # ── Dynamic context builder ───────────────────────────────────────────────────
 
-def build_system() -> list[dict]:
+def build_system(auto_recall: str = "") -> list[dict]:
     """
     Build the system prompt as a two-block list for prompt caching.
 
@@ -502,6 +542,13 @@ Open threads (things Tiff is following up on):
     if mood_text:
         dynamic_block += f"\n{mood_text}\n"
 
+    # Auto-recalled memories relevant to this conversation turn
+    if (auto_recall
+            and "No close matches" not in auto_recall
+            and "No memories yet" not in auto_recall
+            and "Couldn't search" not in auto_recall):
+        dynamic_block += f"\nRelevant memories recalled for this message:\n{auto_recall}\n"
+
     dynamic_block += "[END DYNAMIC CONTEXT]"
 
     return [
@@ -539,7 +586,10 @@ async def chat(user_text: str, image_b64: str | None = None, media_type: str = "
     # 1. Persist the incoming message
     save_message("user", user_text)
 
-    # 2. Build messages from DB (newest user message is last)
+    # 2. Auto-recall relevant memories for this message (runs in thread, non-blocking)
+    auto_mem = await asyncio.to_thread(recall, user_text)
+
+    # 3. Build messages from DB (newest user message is last)
     messages = get_history(limit=MAX_HISTORY_TURNS)
 
     # If there's an image, replace the last user message content with a multimodal block
@@ -564,42 +614,59 @@ async def chat(user_text: str, image_b64: str | None = None, media_type: str = "
                 ]
             }
 
-    # 3. Build system with injected context
-    system = build_system()
+    # 4. Route to the right model + decide if thinking should be enabled
+    model, thinking, max_tokens = _route(user_text)
+    logger.info(f"Routing: model={model}, thinking={'on' if thinking else 'off'}, max_tokens={max_tokens}")
 
-    # 4. Tool-use loop
+    # 5. Build system prompt with auto-recalled context injected
+    system = build_system(auto_recall=auto_mem)
+
+    # 6. Tool-use loop
     loop_guard = 0
-    while loop_guard < 6:  # external tools may chain with memory tools; 6 is safe headroom
+    while loop_guard < 10:
         loop_guard += 1
 
+        api_kwargs: dict = dict(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
+        )
+        if thinking:
+            api_kwargs["thinking"] = thinking
+
         try:
-            response = await client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                system=system,
-                tools=TOOLS,
-                messages=messages
-            )
+            response = await client.messages.create(**api_kwargs)
+        except anthropic.BadRequestError as e:
+            # Thinking not supported on this model — fall back gracefully
+            if "thinking" in str(e).lower() or "extended" in str(e).lower():
+                logger.warning(f"Thinking not supported on {model}, retrying without it.")
+                thinking = None
+                api_kwargs.pop("thinking", None)
+                api_kwargs["max_tokens"] = 1024
+                response = await client.messages.create(**api_kwargs)
+            else:
+                raise
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
             return "something went wrong on my end love 🥺 try again in a sec?"
 
-        # ── End turn: extract and return text ────────────────────────────────
+        # ── End turn: extract text (skip thinking blocks) ─────────────────────
         if response.stop_reason == "end_turn":
             text_parts = [
                 block.text
                 for block in response.content
-                if hasattr(block, "text") and block.text
+                if block.type == "text" and block.text
             ]
             final_text = "".join(text_parts).strip()
 
             if not final_text:
-                final_text = "🤍"  # Shouldn't happen, but fallback
+                final_text = "🤍"
 
             save_message("assistant", final_text)
 
-            # Compress history in the background if it's grown too long.
-            # Runs in a thread so it doesn't delay the Telegram reply.
+            # Compress history in background — never delays the reply
             asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
 
             return final_text
@@ -607,47 +674,48 @@ async def chat(user_text: str, image_b64: str | None = None, media_type: str = "
         # ── Tool use: execute and loop ────────────────────────────────────────
         elif response.stop_reason == "tool_use":
 
-            # Build assistant message content (may mix text + tool_use blocks)
+            # Include thinking blocks in assistant content — required by the API
+            # when thinking is enabled, so Claude can continue reasoning across turns.
             assistant_content = []
             for block in response.content:
-                if block.type == "text":
+                if block.type == "thinking":
+                    assistant_content.append({
+                        "type":     "thinking",
+                        "thinking": block.thinking,
+                    })
+                elif block.type == "text":
                     assistant_content.append({
                         "type": "text",
-                        "text": block.text
+                        "text": block.text,
                     })
                 elif block.type == "tool_use":
                     assistant_content.append({
-                        "type": "tool_use",
+                        "type":  "tool_use",
                         "id":    block.id,
                         "name":  block.name,
-                        "input": block.input
+                        "input": block.input,
                     })
 
             messages.append({"role": "assistant", "content": assistant_content})
 
-            # Execute every tool call and collect results
-            # asyncio.to_thread() runs the sync HTTP calls in a thread pool
-            # so they never block the async event loop
+            # Execute all tool calls concurrently where possible
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
                     result = await asyncio.to_thread(execute_tool, block.name, block.input)
-                    logger.info(f"Tool call: {block.name}({block.input}) → {result}")
+                    logger.info(f"Tool: {block.name}({block.input}) → {str(result)[:120]}")
                     tool_results.append({
                         "type":        "tool_result",
                         "tool_use_id": block.id,
-                        "content":     result
+                        "content":     result,
                     })
 
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
-            # Loop back to call Claude again with the tool results
 
         else:
-            # Unexpected stop reason
             logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
             return "hmm something unexpected happened 🥺 try again?"
 
-    # Shouldn't reach here under normal operation
     logger.error("Tool loop exceeded guard limit")
     return "i got a bit lost in my thoughts 😅 say that again?"

@@ -21,6 +21,8 @@ def check(name, fn):
 # ── Config ────────────────────────────────────────────────────────────────────
 check("config loads",           lambda: __import__("config"))
 check("config.MODEL set",       lambda: __import__("config").MODEL)
+check("config.FAST_MODEL set",  lambda: __import__("config").FAST_MODEL)
+check("config.THINKING_BUDGET", lambda: __import__("config").THINKING_BUDGET >= 0)
 check("config.GNEWS_API_KEY",   lambda: bool(__import__("config").GNEWS_API_KEY))
 check("config.OMDB_API_KEY",    lambda: bool(__import__("config").OMDB_API_KEY))
 
@@ -86,6 +88,10 @@ check("brain imports",                  lambda: __import__("brain"))
 check("brain.build_system() — 2 blocks", lambda: len(__import__("brain").build_system()) == 2)
 check("brain.TOOLS — 24 tools",         lambda: len(__import__("brain").TOOLS) == 24)
 check("brain has asyncio.to_thread",    lambda: "asyncio.to_thread" in open("brain.py", encoding="utf-8").read())
+check("brain._is_complex_query(long)",  lambda: __import__("brain")._is_complex_query("x" * 200))
+check("brain._is_complex_query(kw)",    lambda: __import__("brain")._is_complex_query("explain how this works"))
+check("brain._is_complex_query(casual)",lambda: not __import__("brain")._is_complex_query("hey babe"))
+check("brain._route returns 3-tuple",   lambda: len(__import__("brain")._route("why")) == 3)
 
 # ── Print results ─────────────────────────────────────────────────────────────
 passed = [r for r in results if r[0] == "PASS"]

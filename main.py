@@ -323,7 +323,15 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+    import time
+    RETRY_DELAY = 10  # seconds between startup retries
+    while True:
+        try:
+            main()
+            break  # clean exit (shouldn't happen under normal operation)
+        except KeyboardInterrupt:
+            logger.info("Shutting down 🩷")
+            break
+        except Exception as e:
+            logger.error(f"Startup failed: {e} — retrying in {RETRY_DELAY}s…")
+            time.sleep(RETRY_DELAY)

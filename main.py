@@ -153,6 +153,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sinhala_mode:
         from tools import translate_to_english, translate_to_sinhala
         english_text = await asyncio.to_thread(translate_to_english, user_text)
+        # Tell Claude to stay in plain English so the Sinhala translation is clean.
+        # Without this, the system prompt's "mix back naturally" rule kicks in and
+        # produces Singlish which Google Translate can't convert properly.
+        english_text = (
+            "[System note: The user wrote in Sinhala. "
+            "Reply in plain English only — no Sinhala words — "
+            "your response will be translated back to Sinhala automatically.]\n\n"
+            + english_text
+        )
     else:
         english_text = user_text
 

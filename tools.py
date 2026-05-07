@@ -112,7 +112,10 @@ def get_time(timezone: str = "Asia/Colombo") -> str:
 # ── Web search ────────────────────────────────────────────────────────────────
 
 def search_web(query: str) -> str:
-    """Real web search via DuckDuckGo Lite — parses actual result snippets."""
+    """
+    Web search via DuckDuckGo Lite — real page results, no API key, no rate limits.
+    For Sri Lanka-specific queries, append 'Sri Lanka' to the query.
+    """
     try:
         import re
         r = httpx.get(
@@ -123,33 +126,17 @@ def search_web(query: str) -> str:
             follow_redirects=True,
         )
         r.raise_for_status()
-        html = r.text
-
-        # Extract result links and snippets from DDG Lite's simple HTML
-        # DDG Lite uses single-quoted class attributes
+        html     = r.text
         titles   = re.findall(r"class='result-link'[^>]*>(.*?)</a>", html, re.S)
         snippets = re.findall(r"class='result-snippet'>(.*?)</td>", html, re.S)
-
-        # Strip inline tags
-        def clean(s):
-            return re.sub(r"<[^>]+>", "", s).strip()
-
-        results = []
-        for title, snippet in zip(titles[:5], snippets[:5]):
-            t = clean(title)
-            s = clean(snippet)[:200]
-            if t or s:
-                results.append(f"• {t}\n  {s}")
-
-        if results:
-            return "\n\n".join(results)
-        return f"No results found for '{query}'."
-    except Exception as e:
-        # Last-resort: DuckDuckGo instant answer
-        data = _get("https://api.duckduckgo.com/", q=query, format="json", no_redirect=1, no_html=1)
-        if data and data.get("AbstractText"):
-            return data["AbstractText"]
-        return f"Web search unavailable right now."
+        clean    = lambda s: re.sub(r"<[^>]+>", "", s).strip()
+        results  = [
+            f"• {clean(t)}\n  {clean(s)[:200]}"
+            for t, s in zip(titles[:5], snippets[:5]) if clean(t)
+        ]
+        return "\n\n".join(results) if results else f"No results found for '{query}'."
+    except Exception:
+        return "Web search unavailable right now."
 
 
 # ── Wikipedia ─────────────────────────────────────────────────────────────────

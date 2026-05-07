@@ -27,3 +27,8 @@ MAX_HISTORY_TURNS = 12
 
 # Max facts to inject into the dynamic context block
 MAX_FACTS_IN_CONTEXT = 15
+
+# Summarise history when message count exceeds this threshold.
+# Older messages get compressed into one summary row, keeping the DB lean
+# and reducing input tokens on every request.
+HISTORY_SUMMARISE_THRESHOLD = 40

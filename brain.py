@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
-from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads
+from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads, maybe_summarise_history
 from tools import (
     get_weather, get_time, search_web, search_wikipedia,
     get_news, get_movie, get_book, get_definition,
@@ -368,6 +368,11 @@ async def chat(user_text: str) -> str:
                 final_text = "🤍"  # Shouldn't happen, but fallback
 
             save_message("assistant", final_text)
+
+            # Compress history in the background if it's grown too long.
+            # Runs in a thread so it doesn't delay the Telegram reply.
+            asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
+
             return final_text
 
         # ── Tool use: execute and loop ────────────────────────────────────────

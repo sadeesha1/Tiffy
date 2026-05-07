@@ -11,8 +11,10 @@ Commands:
   /help     → Command list
 """
 
+import asyncio
 import logging
 from telegram import Update
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -33,6 +35,46 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+TELEGRAM_MAX = 4096
+
+async def safe_reply(update: Update, text: str):
+    """
+    Send a reply, splitting on Telegram's 4096-char limit and retrying
+    once on transient timeouts / network errors.
+    """
+    # Split into chunks if needed
+    chunks = [text[i:i + TELEGRAM_MAX] for i in range(0, len(text), TELEGRAM_MAX)]
+    for chunk in chunks:
+        for attempt in range(2):
+            try:
+                await update.message.reply_text(chunk)
+                break
+            except (TimedOut, NetworkError) as e:
+                if attempt == 0:
+                    logger.warning(f"Telegram send failed ({e}), retrying in 3s…")
+                    await asyncio.sleep(3)
+                else:
+                    logger.error(f"Telegram send failed after retry: {e}")
+                    # Last-ditch: send a short fallback so the user isn't left hanging
+                    try:
+                        await update.message.reply_text(
+                            "sorry, i had a little network hiccup 🥺 say that again?"
+                        )
+                    except Exception:
+                        pass
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler — logs cleanly without a full traceback wall."""
+    err = context.error
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning(f"Network error (non-fatal): {err}")
+    else:
+        logger.error(f"Unhandled exception: {err}", exc_info=err)
+
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
 
@@ -64,7 +106,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     response = await chat(user_text)
-    await update.message.reply_text(response)
+    await safe_reply(update, response)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,7 +119,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action=ChatAction.TYPING
     )
     response = await chat("hey tiff, i'm here")
-    await update.message.reply_text(response)
+    await safe_reply(update, response)
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,6 +244,9 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
+
+    # Global error handler — prevents "No error handlers registered" noise
+    app.add_error_handler(error_handler)
 
     logger.info("Tiffany is awake 🩷")
     app.run_polling(drop_pending_updates=True)

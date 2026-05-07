@@ -112,23 +112,44 @@ def get_time(timezone: str = "Asia/Colombo") -> str:
 # ── Web search ────────────────────────────────────────────────────────────────
 
 def search_web(query: str) -> str:
-    """Quick web answer using DuckDuckGo Instant Answer."""
-    data = _get("https://api.duckduckgo.com/", q=query, format="json", no_redirect=1, no_html=1)
-    if not data:
-        return "Couldn't reach search right now."
+    """Real web search via DuckDuckGo Lite — parses actual result snippets."""
+    try:
+        import re
+        r = httpx.get(
+            "https://lite.duckduckgo.com/lite/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=TIMEOUT,
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        html = r.text
 
-    parts = []
-    if data.get("AbstractText"):
-        parts.append(data["AbstractText"])
-    if data.get("Answer"):
-        parts.append(f"Answer: {data['Answer']}")
-    for topic in data.get("RelatedTopics", [])[:3]:
-        if isinstance(topic, dict) and topic.get("Text"):
-            parts.append(f"• {topic['Text']}")
+        # Extract result links and snippets from DDG Lite's simple HTML
+        # DDG Lite uses single-quoted class attributes
+        titles   = re.findall(r"class='result-link'[^>]*>(.*?)</a>", html, re.S)
+        snippets = re.findall(r"class='result-snippet'>(.*?)</td>", html, re.S)
 
-    if not parts:
-        return f"No instant answer found for '{query}'. Try search_wikipedia for factual questions."
-    return "\n".join(parts)
+        # Strip inline tags
+        def clean(s):
+            return re.sub(r"<[^>]+>", "", s).strip()
+
+        results = []
+        for title, snippet in zip(titles[:5], snippets[:5]):
+            t = clean(title)
+            s = clean(snippet)[:200]
+            if t or s:
+                results.append(f"• {t}\n  {s}")
+
+        if results:
+            return "\n\n".join(results)
+        return f"No results found for '{query}'."
+    except Exception as e:
+        # Last-resort: DuckDuckGo instant answer
+        data = _get("https://api.duckduckgo.com/", q=query, format="json", no_redirect=1, no_html=1)
+        if data and data.get("AbstractText"):
+            return data["AbstractText"]
+        return f"Web search unavailable right now."
 
 
 # ── Wikipedia ─────────────────────────────────────────────────────────────────
@@ -188,24 +209,40 @@ def get_news(topic: str, country: str = "lk") -> str:
 # ── Movie / TV ────────────────────────────────────────────────────────────────
 
 def get_movie(title: str) -> str:
-    """Movie or TV show info from OMDB (IMDb data)."""
+    """
+    Movie or TV show info from OMDB (IMDb data).
+    For exact titles: returns full details.
+    For discovery queries (e.g. 'top 2026 action films'): returns a list of matches.
+    """
     if not OMDB_API_KEY:
         return "OMDB API key not configured."
-    data = _get("http://www.omdbapi.com/", t=title, apikey=OMDB_API_KEY, plot="short")
-    if not data or data.get("Response") == "False":
-        return f"Movie/show '{title}' not found."
 
-    lines = [
-        f"{data.get('Title')} ({data.get('Year')}) — {data.get('Type', '').capitalize()}",
-        f"Genre: {data.get('Genre')}",
-        f"Director: {data.get('Director')}",
-        f"Cast: {data.get('Actors')}",
-        f"IMDb: {data.get('imdbRating')}/10 ({data.get('imdbVotes')} votes)",
-        f"Runtime: {data.get('Runtime')}",
-        f"\n{data.get('Plot')}",
-    ]
-    if data.get("Awards") and data["Awards"] != "N/A":
-        lines.append(f"Awards: {data['Awards']}")
+    # Try exact title lookup first
+    data = _get("http://www.omdbapi.com/", t=title, apikey=OMDB_API_KEY, plot="short")
+    if data and data.get("Response") != "False":
+        lines = [
+            f"{data.get('Title')} ({data.get('Year')}) — {data.get('Type', '').capitalize()}",
+            f"Genre: {data.get('Genre')}",
+            f"Director: {data.get('Director')}",
+            f"Cast: {data.get('Actors')}",
+            f"IMDb: {data.get('imdbRating')}/10 ({data.get('imdbVotes')} votes)",
+            f"Runtime: {data.get('Runtime')}",
+            f"\n{data.get('Plot')}",
+        ]
+        if data.get("Awards") and data["Awards"] != "N/A":
+            lines.append(f"Awards: {data['Awards']}")
+        return "\n".join(lines)
+
+    # Exact lookup failed — try keyword search (returns up to 10 results)
+    search = _get("http://www.omdbapi.com/", s=title, apikey=OMDB_API_KEY, type="movie")
+    if not search or search.get("Response") == "False":
+        return f"No results found for '{title}'."
+
+    movies = search.get("Search", [])[:8]
+    lines = [f"Search results for '{title}':"]
+    for m in movies:
+        lines.append(f"• {m.get('Title')} ({m.get('Year')}) — imdbID: {m.get('imdbID')}")
+    lines.append("\nUse get_movie with the exact title for full details and IMDb rating.")
     return "\n".join(lines)
 
 

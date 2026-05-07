@@ -12,7 +12,10 @@ Commands:
 """
 
 import asyncio
+import base64
 import logging
+import os
+import tempfile
 from telegram import Update
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
@@ -24,12 +27,13 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID
+from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID, DAILY_DIGEST_HOUR
 from memory import (
     init_db, get_all_facts, clear_history, clear_all,
     get_open_threads, close_thread,
     get_due_reminders, mark_reminder_sent,
     save_setting, get_setting,
+    get_reminders_for_today,
 )
 from brain import chat
 
@@ -88,30 +92,117 @@ def is_sinhala(text: str) -> bool:
     return any('඀' <= c <= '෿' for c in text)
 
 
-# ── Reminder background loop ──────────────────────────────────────────────────
+# ── Document text extraction ──────────────────────────────────────────────────
+
+def extract_text(file_path: str) -> str:
+    """Extract plain text from a PDF, DOCX, or TXT file."""
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".pdf":
+            import pypdf
+            reader = pypdf.PdfReader(file_path)
+            parts = [page.extract_text() or "" for page in reader.pages]
+            return "\n".join(parts).strip()
+        elif ext in (".docx", ".doc"):
+            import docx
+            doc = docx.Document(file_path)
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        else:
+            # Treat as plain text
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+    except Exception as e:
+        return f"[Couldn't read file: {e}]"
+
+
+# ── Daily digest ──────────────────────────────────────────────────────────────
+
+async def send_daily_digest(app: Application, chat_id: int) -> None:
+    """Build and send Tiff's morning digest."""
+    from tools import get_weather, get_quote, get_local_news
+    from memory import get_setting
+
+    city    = get_setting("location_city") or "Negombo"
+    country = get_setting("location_country") or "Sri Lanka"
+
+    # Gather pieces in threads so we don't block
+    weather = await asyncio.to_thread(get_weather, f"{city}, {country}")
+    quote   = await asyncio.to_thread(get_quote)
+    news    = await asyncio.to_thread(get_local_news, "all")
+    reminders = get_reminders_for_today()
+
+    # Build the digest text
+    lines = ["🌅 good morning love! here's your morning digest 🩷\n"]
+
+    lines.append(f"☀️ **weather in {city}**\n{weather[:300]}\n")
+
+    if reminders:
+        lines.append("⏰ **things on your plate today:**")
+        for r in reminders[:5]:
+            time_str = r["remind_at"][11:16]  # HH:MM
+            lines.append(f"  • {r['message']} at {time_str}")
+        lines.append("")
+
+    if news and "unavailable" not in news.lower():
+        lines.append("📰 **local headlines:**")
+        # Take first 3 news items
+        news_lines = [l for l in news.split("\n") if l.startswith("[")][:3]
+        for nl in news_lines:
+            lines.append(f"  {nl}")
+        lines.append("")
+
+    lines.append(f"✨ **thought for today:**\n{quote}")
+
+    digest_text = "\n".join(lines)
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=digest_text)
+        logger.info("Daily digest sent ✓")
+    except Exception as e:
+        logger.error(f"Failed to send daily digest: {e}")
+
+
+# ── Reminder + digest background loop ────────────────────────────────────────
 
 async def reminder_loop(app: Application) -> None:
     """
-    Runs every 60 seconds. Fires any reminders whose remind_at has passed
-    and sends them directly to the user's Telegram chat.
+    Runs every 60 seconds.
+    - Fires any reminders whose remind_at has passed
+    - Sends daily digest at DAILY_DIGEST_HOUR (Sri Lanka time)
     """
+    digest_sent_today: str = ""  # track date string so we only send once
+
     while True:
         await asyncio.sleep(60)
         try:
-            chat_id = get_setting("chat_id")
-            if not chat_id:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            chat_id_str = get_setting("chat_id")
+            if not chat_id_str:
                 continue  # No messages yet — don't know where to send
+
+            chat_id = int(chat_id_str)
+            now_sl  = datetime.now(ZoneInfo("Asia/Colombo"))
+
+            # ── Fire due reminders ────────────────────────────────────────────
             due = get_due_reminders()
             for r in due:
                 try:
                     await app.bot.send_message(
-                        chat_id=int(chat_id),
+                        chat_id=chat_id,
                         text=f"⏰ hey! reminder: {r['message']} 🩷"
                     )
                     mark_reminder_sent(r["id"])
                     logger.info(f"Reminder sent: {r['message']}")
                 except Exception as e:
                     logger.error(f"Failed to send reminder #{r['id']}: {e}")
+
+            # ── Daily digest at configured hour ───────────────────────────────
+            today_str = now_sl.strftime("%Y-%m-%d")
+            if now_sl.hour == DAILY_DIGEST_HOUR and digest_sent_today != today_str:
+                digest_sent_today = today_str
+                asyncio.create_task(send_daily_digest(app, chat_id))
+
         except Exception as e:
             logger.error(f"Reminder loop error: {e}")
 
@@ -176,6 +267,152 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sinhala_mode:
         response = await asyncio.to_thread(translate_to_sinhala, response)
 
+    await safe_reply(update, response)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages — passes the image to Claude for vision analysis."""
+    if not is_authorized(update):
+        return
+
+    save_setting("chat_id", str(update.effective_chat.id))
+
+    # Download the highest-resolution version of the photo
+    photo = update.message.photo[-1]
+    caption = (update.message.caption or "").strip()
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        tg_file = await photo.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        with open(tmp_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode("utf-8")
+        os.unlink(tmp_path)
+
+        prompt = caption if caption else "i sent you a photo 👀"
+        response = await chat(prompt, image_b64=image_b64, media_type="image/jpeg")
+    except Exception as e:
+        logger.error(f"Photo handler error: {e}")
+        response = "something went wrong loading that photo 🥺 try again?"
+
+    await safe_reply(update, response)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads — extract text and summarise or answer questions about them."""
+    if not is_authorized(update):
+        return
+
+    save_setting("chat_id", str(update.effective_chat.id))
+
+    doc      = update.message.document
+    filename = doc.file_name or "document"
+    caption  = (update.message.caption or "").strip()
+    ext      = os.path.splitext(filename)[1].lower()
+
+    if ext not in (".pdf", ".docx", ".doc", ".txt", ".md"):
+        await update.message.reply_text(
+            f"i can read PDFs, Word docs (.docx), and text files (.txt) 📄\n"
+            f"that looks like a {ext or 'unknown'} file — i can't open that one 😅"
+        )
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        tg_file = await doc.get_file()
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        text = await asyncio.to_thread(extract_text, tmp_path)
+        os.unlink(tmp_path)
+
+        if not text or text.startswith("[Couldn't"):
+            await update.message.reply_text(
+                f"hmm i couldn't read that file 🥺 is it a normal {ext} document?"
+            )
+            return
+
+        # Truncate very long documents to keep tokens sane
+        MAX_DOC_CHARS = 8000
+        truncated = text[:MAX_DOC_CHARS]
+        truncation_note = f"\n\n[document truncated to {MAX_DOC_CHARS} chars]" if len(text) > MAX_DOC_CHARS else ""
+
+        question = caption if caption else "summarise this for me"
+        user_msg = (
+            f"[Document: {filename}]\n"
+            f"---\n{truncated}{truncation_note}\n---\n\n"
+            f"{question}"
+        )
+
+        response = await chat(user_msg)
+    except Exception as e:
+        logger.error(f"Document handler error: {e}")
+        response = "something went weird reading that file 🥺 try again?"
+
+    await safe_reply(update, response)
+
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle location shares — save coordinates and reverse-geocode to city."""
+    if not is_authorized(update):
+        return
+
+    save_setting("chat_id", str(update.effective_chat.id))
+
+    loc = update.message.location
+    lat, lon = loc.latitude, loc.longitude
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    # Reverse geocode via Nominatim (free, no key)
+    city    = "your location"
+    country = ""
+    try:
+        import httpx as _httpx
+        r = _httpx.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json"},
+            headers={"User-Agent": "TiffBot/1.0"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            addr = r.json().get("address", {})
+            city    = addr.get("city") or addr.get("town") or addr.get("village") or "your location"
+            country = addr.get("country", "")
+    except Exception as e:
+        logger.warning(f"Reverse geocode failed: {e}")
+
+    # Save to settings
+    from memory import save_setting as _ss
+    _ss("location_city",    city)
+    _ss("location_country", country)
+    _ss("location_lat",     str(lat))
+    _ss("location_lon",     str(lon))
+
+    location_str = f"{city}, {country}".strip(", ")
+    prompt = (
+        f"[System: Sadeesha just shared his live location. "
+        f"Coordinates: {lat:.4f}, {lon:.4f}. "
+        f"Reverse geocoded to: {location_str}. "
+        f"Location saved for weather and local queries.] "
+        f"Acknowledge naturally."
+    )
+    response = await chat(prompt)
     await safe_reply(update, response)
 
 
@@ -314,6 +551,15 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
+
+    # Vision — photo messages
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Document reader — PDF, DOCX, TXT
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Location sharing
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
     # Global error handler — prevents "No error handlers registered" noise
     app.add_error_handler(error_handler)

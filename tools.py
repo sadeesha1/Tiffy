@@ -341,3 +341,100 @@ def translate_to_sinhala(text: str) -> str:
         return GoogleTranslator(source="en", target="si").translate(text) or text
     except Exception as e:
         return text  # Fall back to English — still readable
+
+
+# ── Local news (RSS) ──────────────────────────────────────────────────────────
+
+def get_local_news(source: str = "all") -> str:
+    """
+    Latest Sri Lanka news from Ada Derana and Daily Mirror RSS feeds.
+    source: "adaderana", "dailymirror", or "all" (default)
+    """
+    import xml.etree.ElementTree as ET
+
+    feeds = {
+        "adaderana":   "https://www.adaderana.lk/rss.php",
+        "dailymirror": "https://www.dailymirror.lk/rss",
+    }
+
+    src = source.strip().lower()
+    if src == "all":
+        targets = list(feeds.items())
+    elif src in feeds:
+        targets = [(src, feeds[src])]
+    else:
+        targets = list(feeds.items())
+
+    all_items = []
+    for feed_name, url in targets:
+        try:
+            r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=TIMEOUT, follow_redirects=True)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            channel = root.find("channel")
+            if channel is None:
+                continue
+            items = channel.findall("item")[:5]
+            for item in items:
+                title = (item.findtext("title") or "").strip()
+                pub   = (item.findtext("pubDate") or "")[:16]
+                desc  = (item.findtext("description") or "").strip()
+                # Strip any HTML tags from description
+                import re
+                desc = re.sub(r"<[^>]+>", "", desc)[:150]
+                if title:
+                    all_items.append(f"[{feed_name}] {title}")
+                    if desc:
+                        all_items.append(f"  {desc}{'…' if len(desc) == 150 else ''}")
+        except Exception as exc:
+            all_items.append(f"[{feed_name}] feed unavailable: {exc}")
+
+    return "\n".join(all_items) if all_items else "No local news available right now."
+
+
+# ── Calculator ────────────────────────────────────────────────────────────────
+
+def calculate(expression: str) -> str:
+    """
+    Safely evaluate a mathematical expression.
+    Supports: +, -, *, /, **, %, //, abs(), round(), int(), float(), sqrt(), log(), sin(), cos(), tan(), pi, e
+    """
+    import math
+    import ast
+
+    safe_names = {
+        "abs": abs, "round": round, "int": int, "float": float,
+        "min": min, "max": max, "sum": sum, "pow": pow,
+        "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "pi": math.pi, "e": math.e, "ceil": math.ceil, "floor": math.floor,
+    }
+
+    expr = expression.strip()
+    # Reject anything that looks suspicious
+    if any(kw in expr for kw in ["import", "exec", "eval", "open", "__", "os.", "sys."]):
+        return "That expression isn't something I can calculate safely."
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+        # Only allow safe node types
+        allowed = {
+            ast.Expression, ast.BinOp, ast.UnaryOp, ast.Call, ast.Num,
+            ast.Constant, ast.Name, ast.Load,
+            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
+            ast.FloorDiv, ast.USub, ast.UAdd,
+        }
+        for node in ast.walk(tree):
+            if type(node) not in allowed:
+                return f"Unsupported operation in expression."
+        result = eval(compile(tree, "<string>", "eval"), {"__builtins__": {}}, safe_names)
+        # Format nicely: avoid 3.9999999999 style float noise
+        if isinstance(result, float) and result == int(result):
+            result = int(result)
+        elif isinstance(result, float):
+            result = round(result, 10)
+        return f"{expression} = {result}"
+    except ZeroDivisionError:
+        return "Can't divide by zero 😅"
+    except Exception as e:
+        return f"Couldn't calculate that: {e}"

@@ -32,3 +32,6 @@ MAX_FACTS_IN_CONTEXT = 15
 # Older messages get compressed into one summary row, keeping the DB lean
 # and reducing input tokens on every request.
 HISTORY_SUMMARISE_THRESHOLD = 40
+
+# Hour (Sri Lanka time, 0-23) at which the daily morning digest is sent.
+DAILY_DIGEST_HOUR = int(os.getenv("DAILY_DIGEST_HOUR", "7"))

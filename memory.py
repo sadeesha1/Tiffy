@@ -98,6 +98,31 @@ def init_db():
                 value TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS people (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL,
+                details    TEXT    NOT NULL,
+                updated_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT    NOT NULL,
+                content    TEXT    NOT NULL,
+                tags       TEXT    DEFAULT '',
+                created_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mood_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                score      INTEGER NOT NULL,
+                note       TEXT    DEFAULT '',
+                logged_at  TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
     try:
         _init_vector_db()
@@ -309,6 +334,137 @@ def get_setting(key: str) -> str | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
+
+
+# ── People (relationship memory) ──────────────────────────────────────────────
+
+def remember_person(name: str, details: str) -> str:
+    """Save or update what Tiff knows about a specific person."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            existing = conn.execute(
+                "SELECT id, details FROM people WHERE LOWER(name)=LOWER(?)", (name,)
+            ).fetchone()
+            if existing:
+                merged = existing[1] + "\n" + details
+                conn.execute(
+                    "UPDATE people SET details=?, updated_at=datetime('now') WHERE id=?",
+                    (merged, existing[0])
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO people (name, details) VALUES (?, ?)", (name, details)
+                )
+            conn.commit()
+        return f"Remembered about {name}: {details}"
+    except Exception as e:
+        return f"Couldn't save person: {e}"
+
+
+def get_person(name: str) -> str:
+    """Retrieve everything Tiff knows about a named person."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT name, details FROM people WHERE LOWER(name)=LOWER(?)", (name,)
+            ).fetchone()
+        if row:
+            return f"What I know about {row[0]}:\n{row[1]}"
+        return f"I don't have any notes about {name} yet."
+    except Exception as e:
+        return f"Couldn't retrieve person: {e}"
+
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+
+def save_note(title: str, content: str, tags: str = "") -> str:
+    """Save a note with optional tags (comma-separated)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO notes (title, content, tags) VALUES (?, ?, ?)",
+                (title, content, tags)
+            )
+            conn.commit()
+        return f"Note saved: '{title}'"
+    except Exception as e:
+        return f"Couldn't save note: {e}"
+
+
+def search_notes(query: str) -> str:
+    """Search notes by title, content, or tags (simple text match)."""
+    try:
+        q = f"%{query}%"
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT title, content, tags, created_at FROM notes "
+                "WHERE title LIKE ? OR content LIKE ? OR tags LIKE ? ORDER BY id DESC LIMIT 5",
+                (q, q, q)
+            ).fetchall()
+        if not rows:
+            return f"No notes found matching '{query}'."
+        lines = [f"Notes matching '{query}':"]
+        for title, content, tags, created in rows:
+            preview = content[:100] + ("…" if len(content) > 100 else "")
+            tag_str = f" [{tags}]" if tags else ""
+            lines.append(f"\n• {title}{tag_str} ({created[:10]})\n  {preview}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Couldn't search notes: {e}"
+
+
+# ── Mood tracking ─────────────────────────────────────────────────────────────
+
+def log_mood(score: int, note: str = "") -> str:
+    """Log Sadeesha's mood (1-10 scale) with an optional note."""
+    try:
+        score = max(1, min(10, int(score)))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO mood_log (score, note) VALUES (?, ?)", (score, note)
+            )
+            conn.commit()
+        emoji = "😊" if score >= 7 else "😐" if score >= 4 else "😔"
+        return f"Mood logged: {score}/10 {emoji}" + (f" — {note}" if note else "")
+    except Exception as e:
+        return f"Couldn't log mood: {e}"
+
+
+def get_mood_trend(days: int = 7) -> str:
+    """Return mood summary for the past N days."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT score, note, logged_at FROM mood_log "
+                "WHERE logged_at >= datetime('now', ?) ORDER BY logged_at DESC",
+                (f"-{days} days",)
+            ).fetchall()
+        if not rows:
+            return ""
+        avg = sum(r[0] for r in rows) / len(rows)
+        latest = rows[0]
+        trend = f"Mood trend ({days}d): avg {avg:.1f}/10 from {len(rows)} logs. Latest: {latest[0]}/10"
+        if latest[1]:
+            trend += f" — {latest[1]}"
+        return trend
+    except Exception:
+        return ""
+
+
+def get_reminders_for_today() -> list[dict]:
+    """Return all unsent reminders due in the next 24 hours."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Colombo"))
+    start = now.strftime("%Y-%m-%dT%H:%M:%S")
+    end   = now.replace(hour=23, minute=59, second=59).strftime("%Y-%m-%dT%H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT id, message, remind_at FROM reminders "
+            "WHERE sent=0 AND remind_at BETWEEN ? AND ? ORDER BY remind_at",
+            (start, end)
+        )
+        return [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in cursor.fetchall()]
 
 
 # ── Conversation history ──────────────────────────────────────────────────────

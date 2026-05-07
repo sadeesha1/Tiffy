@@ -1,6 +1,10 @@
 """Smoke test — run from the Tiff directory: python smoke_test.py"""
-import sys, time
+import sys, time, io
 sys.path.insert(0, ".")
+
+# Force UTF-8 output so emoji in stored messages don't crash on Windows cp1252
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 results = []
 
@@ -35,7 +39,7 @@ check("tools imports",          lambda: __import__("tools"))
 from tools import (
     get_weather, get_time, search_wikipedia, get_exchange_rate,
     get_holidays, get_definition, get_quote, search_web,
-    get_book, get_movie, get_news,
+    get_book, get_movie, get_news, get_local_news, calculate,
 )
 
 # ── Tools: time (local zoneinfo — no network) ─────────────────────────────────
@@ -62,10 +66,25 @@ check("get_news(Sri Lanka)",            lambda: get_news("Sri Lanka"))
 check("get_news(cricket)",              lambda: get_news("cricket"))
 check("get_movie(Interstellar)",        lambda: get_movie("Interstellar"))
 
+# ── New tools ────────────────────────────────────────────────────────────────
+check("get_local_news(all)",            lambda: get_local_news("all"))
+check("get_local_news(adaderana)",      lambda: get_local_news("adaderana"))
+check("calculate(simple)",             lambda: calculate("2 + 2"))
+check("calculate(complex)",            lambda: calculate("sqrt(144) + round(3.7)"))
+check("calculate(formula)",            lambda: calculate("(1200 * 0.18) / 12"))
+
+# ── Memory: new functions ─────────────────────────────────────────────────────
+check("memory.remember_person()",      lambda: __import__("memory").remember_person("Test User", "a test contact"))
+check("memory.get_person()",           lambda: __import__("memory").get_person("Test User"))
+check("memory.save_note()",            lambda: __import__("memory").save_note("Test Note", "content of the test note", "test"))
+check("memory.search_notes()",         lambda: __import__("memory").search_notes("test"))
+check("memory.log_mood()",             lambda: __import__("memory").log_mood(8, "feeling good"))
+check("memory.get_mood_trend()",       lambda: __import__("memory").get_mood_trend(7))
+
 # ── Brain ─────────────────────────────────────────────────────────────────────
 check("brain imports",                  lambda: __import__("brain"))
 check("brain.build_system() — 2 blocks", lambda: len(__import__("brain").build_system()) == 2)
-check("brain.TOOLS — 16 tools",         lambda: len(__import__("brain").TOOLS) == 16)
+check("brain.TOOLS — 24 tools",         lambda: len(__import__("brain").TOOLS) == 24)
 check("brain has asyncio.to_thread",    lambda: "asyncio.to_thread" in open("brain.py", encoding="utf-8").read())
 
 # ── Print results ─────────────────────────────────────────────────────────────
@@ -86,6 +105,6 @@ for status, name, detail, ms in results:
         print(f"     {snippet}")
 print(f"{'-'*60}")
 print(f"  {len(passed)} passed  |  {len(failed)} failed")
-print(f"{'─'*60}\n")
+print(f"{'-'*60}\n")
 
 sys.exit(0 if not failed else 1)

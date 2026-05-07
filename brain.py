@@ -16,11 +16,17 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
-from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads, maybe_summarise_history, set_reminder
+from memory import (
+    remember, recall, save_message, get_history, get_all_facts,
+    open_thread, close_thread, get_open_threads, maybe_summarise_history,
+    set_reminder, remember_person, get_person, save_note, search_notes,
+    log_mood, get_mood_trend, get_setting, save_setting,
+)
 from tools import (
     get_weather, get_time, search_web, search_wikipedia,
     get_news, get_movie, get_book, get_definition,
     get_holidays, get_quote, get_exchange_rate,
+    get_local_news, calculate,
 )
 from prompt import SYSTEM_PROMPT
 
@@ -249,13 +255,138 @@ TOOLS = [
             },
             "required": ["message", "remind_at"]
         }
-    }
+    },
+    # ── Relationship memory ───────────────────────────────────────────────────
+    {
+        "name": "remember_person",
+        "description": (
+            "Save or update information about a specific person Sadeesha mentions — "
+            "a friend, family member, colleague, or anyone who comes up in conversation. "
+            "Use this to keep track of who matters to him and what you know about them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name":    {"type": "string", "description": "The person's name."},
+                "details": {"type": "string", "description": "What to remember about them — relationship, personality, recent events, etc."}
+            },
+            "required": ["name", "details"]
+        }
+    },
+    {
+        "name": "get_person",
+        "description": "Look up everything you know about a specific person by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The person's name to look up."}
+            },
+            "required": ["name"]
+        }
+    },
+    # ── Notes ─────────────────────────────────────────────────────────────────
+    {
+        "name": "save_note",
+        "description": (
+            "Save a note for Sadeesha — an idea, a to-do, a list, anything worth writing down. "
+            "Use this when he asks you to remember something specific that isn't about a person or a fact."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title":   {"type": "string", "description": "Short title for the note."},
+                "content": {"type": "string", "description": "The full content of the note."},
+                "tags":    {"type": "string", "description": "Optional comma-separated tags e.g. 'work,ideas,lucya'"}
+            },
+            "required": ["title", "content"]
+        }
+    },
+    {
+        "name": "search_notes",
+        "description": "Search through saved notes by keyword, title, or tag.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keyword or tag to search notes for."}
+            },
+            "required": ["query"]
+        }
+    },
+    # ── Mood tracking ─────────────────────────────────────────────────────────
+    {
+        "name": "log_mood",
+        "description": (
+            "Log how Sadeesha is feeling on a 1-10 scale. Use this when he expresses "
+            "how he's feeling, or when you naturally sense his mood from the conversation. "
+            "1 = very low, 10 = amazing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer", "description": "Mood score 1-10."},
+                "note":  {"type": "string",  "description": "Optional short note about why or what's going on."}
+            },
+            "required": ["score"]
+        }
+    },
+    # ── Location ──────────────────────────────────────────────────────────────
+    {
+        "name": "set_location",
+        "description": (
+            "Save Sadeesha's current location. Use this when he shares his location "
+            "or tells you where he is. The location is used for weather and local info."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "city":    {"type": "string", "description": "City name e.g. 'Negombo'."},
+                "country": {"type": "string", "description": "Country e.g. 'Sri Lanka'."},
+                "lat":     {"type": "number", "description": "Latitude (optional)."},
+                "lon":     {"type": "number", "description": "Longitude (optional)."}
+            },
+            "required": ["city"]
+        }
+    },
+    # ── Local news ────────────────────────────────────────────────────────────
+    {
+        "name": "get_local_news",
+        "description": (
+            "Get the latest Sri Lanka news from Ada Derana and Daily Mirror RSS feeds. "
+            "Use this for local Sri Lanka news, breaking news, or when he asks what's happening in Sri Lanka."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "News source: 'adaderana', 'dailymirror', or 'all' (default). Use 'all' unless he asks for a specific source."
+                }
+            },
+            "required": []
+        }
+    },
+    # ── Calculator ────────────────────────────────────────────────────────────
+    {
+        "name": "calculate",
+        "description": (
+            "Evaluate a mathematical expression accurately. Use this for any calculations — "
+            "arithmetic, percentages, currency conversions, split bills, mortgage estimates, etc. "
+            "Supports: +, -, *, /, **, sqrt(), log(), sin(), cos(), pi, e, round(), etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Mathematical expression to evaluate e.g. '(450 * 1.08) / 3' or 'sqrt(144)'"}
+            },
+            "required": ["expression"]
+        }
+    },
 ]
 
 
 def execute_tool(name: str, inputs: dict) -> str:
     """Run a tool by name and return its result as a string."""
-    # Memory tools
+    # ── Memory tools ──────────────────────────────────────────────────────────
     if name == "remember":
         return remember(inputs.get("fact", ""))
     elif name == "recall":
@@ -266,9 +397,37 @@ def execute_tool(name: str, inputs: dict) -> str:
         return close_thread(inputs.get("thread_id", 0))
     elif name == "set_reminder":
         return set_reminder(inputs.get("message", ""), inputs.get("remind_at", ""))
-    # External tools
+    elif name == "remember_person":
+        return remember_person(inputs.get("name", ""), inputs.get("details", ""))
+    elif name == "get_person":
+        return get_person(inputs.get("name", ""))
+    elif name == "save_note":
+        return save_note(inputs.get("title", ""), inputs.get("content", ""), inputs.get("tags", ""))
+    elif name == "search_notes":
+        return search_notes(inputs.get("query", ""))
+    elif name == "log_mood":
+        return log_mood(inputs.get("score", 5), inputs.get("note", ""))
+    elif name == "set_location":
+        city    = inputs.get("city", "Negombo")
+        country = inputs.get("country", "Sri Lanka")
+        lat     = inputs.get("lat")
+        lon     = inputs.get("lon")
+        save_setting("location_city",    city)
+        save_setting("location_country", country)
+        if lat is not None:
+            save_setting("location_lat", str(lat))
+        if lon is not None:
+            save_setting("location_lon", str(lon))
+        return f"Location saved: {city}, {country}"
+    # ── External tools ────────────────────────────────────────────────────────
     elif name == "get_weather":
-        return get_weather(inputs.get("location", "Colombo"))
+        # Use saved location if no explicit location given
+        location = inputs.get("location", "")
+        if not location:
+            city    = get_setting("location_city") or "Negombo"
+            country = get_setting("location_country") or "Sri Lanka"
+            location = f"{city}, {country}"
+        return get_weather(location)
     elif name == "get_time":
         return get_time(inputs.get("timezone", "Asia/Colombo"))
     elif name == "search_web":
@@ -277,6 +436,8 @@ def execute_tool(name: str, inputs: dict) -> str:
         return search_wikipedia(inputs.get("query", ""))
     elif name == "get_news":
         return get_news(inputs.get("topic", ""))
+    elif name == "get_local_news":
+        return get_local_news(inputs.get("source", "all"))
     elif name == "get_movie":
         return get_movie(inputs.get("title", ""))
     elif name == "get_book":
@@ -289,6 +450,8 @@ def execute_tool(name: str, inputs: dict) -> str:
         return get_quote()
     elif name == "get_exchange_rate":
         return get_exchange_rate(inputs.get("from_currency", "USD"), inputs.get("to_currency", "LKR"))
+    elif name == "calculate":
+        return calculate(inputs.get("expression", ""))
     return f"Unknown tool: {name}"
 
 
@@ -318,15 +481,28 @@ def build_system() -> list[dict]:
     else:
         threads_text = "None."
 
+    # Location context
+    city    = get_setting("location_city")
+    country = get_setting("location_country")
+    location_text = f"{city}, {country}" if city else "Negombo, Sri Lanka (default)"
+
+    # Mood trend
+    mood_text = get_mood_trend(days=7)
+
     dynamic_block = f"""[DYNAMIC CONTEXT]
 Today: {now}
+Sadeesha's location: {location_text}
 
 Things Tiff remembers about Sadeesha and their relationship:
 {facts_text}
 
 Open threads (things Tiff is following up on):
 {threads_text}
-[END DYNAMIC CONTEXT]"""
+"""
+    if mood_text:
+        dynamic_block += f"\n{mood_text}\n"
+
+    dynamic_block += "[END DYNAMIC CONTEXT]"
 
     return [
         {
@@ -343,9 +519,14 @@ Open threads (things Tiff is following up on):
 
 # ── Main chat function ────────────────────────────────────────────────────────
 
-async def chat(user_text: str) -> str:
+async def chat(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
     """
     Process one user message through Tiff's brain.
+
+    Args:
+        user_text:  The text message from Sadeesha.
+        image_b64:  Optional base64-encoded image for vision requests.
+        media_type: MIME type of the image (default: image/jpeg).
 
     Flow:
       1. Save the user message to history
@@ -360,6 +541,28 @@ async def chat(user_text: str) -> str:
 
     # 2. Build messages from DB (newest user message is last)
     messages = get_history(limit=MAX_HISTORY_TURNS)
+
+    # If there's an image, replace the last user message content with a multimodal block
+    if image_b64:
+        last_msg = messages[-1] if messages else None
+        if last_msg and last_msg["role"] == "user":
+            messages[-1] = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type":       "base64",
+                            "media_type": media_type,
+                            "data":       image_b64,
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": user_text or "what do you see?"
+                    }
+                ]
+            }
 
     # 3. Build system with injected context
     system = build_system()

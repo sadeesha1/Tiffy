@@ -23,7 +23,7 @@ from telegram.ext import (
 from telegram.constants import ChatAction
 
 from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID
-from memory import init_db, get_all_facts, clear_history, clear_all
+from memory import init_db, get_all_facts, clear_history, clear_all, get_open_threads, close_thread
 from brain import chat
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -127,6 +127,40 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_threads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/threads — Show all open threads Tiff is tracking."""
+    if not is_authorized(update):
+        return
+
+    threads = get_open_threads()
+    if not threads:
+        await update.message.reply_text(
+            "no open threads right now 🤍\neverything's resolved or we haven't started tracking yet."
+        )
+        return
+
+    lines = ["things i'm keeping an eye on 🧵\n"]
+    for t in threads:
+        lines.append(f"#{t['id']} — {t['summary']}")
+
+    lines.append("\nuse /resolve <id> to close one")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resolve <id> — Close an open thread by ID."""
+    if not is_authorized(update):
+        return
+
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("usage: /resolve <thread id>\ne.g. /resolve 3")
+        return
+
+    result = close_thread(int(args[0]))
+    await update.message.reply_text(f"{result} 🤍")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/help — Show available commands."""
     if not is_authorized(update):
@@ -136,6 +170,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "commands 🩷\n\n"
         "/start — wake tiff up\n"
         "/memory — see what tiff remembers\n"
+        "/threads — see open threads tiff is tracking\n"
+        "/resolve <id> — close a thread\n"
         "/clear — clear chat history (keeps memories)\n"
         "/reset — clear everything (nuclear)\n"
         "/help — this list"
@@ -154,11 +190,13 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Register command handlers
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
-    app.add_handler(CommandHandler("reset",  cmd_reset))
-    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("memory",  cmd_memory))
+    app.add_handler(CommandHandler("threads", cmd_threads))
+    app.add_handler(CommandHandler("resolve", cmd_resolve))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
+    app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("help",    cmd_help))
 
     # Main message handler (text only, ignores commands)
     app.add_handler(

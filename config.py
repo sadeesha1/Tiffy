@@ -1,12 +1,16 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY")
 DB_PATH            = os.getenv("DB_PATH", "tiffany.db")
 MODEL              = os.getenv("MODEL", "claude-haiku-4-5-20251001")
+QDRANT_PATH        = os.getenv("QDRANT_PATH", "./qdrant_storage")
+EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+GNEWS_API_KEY      = os.getenv("GNEWS_API_KEY", "")
+OMDB_API_KEY       = os.getenv("OMDB_API_KEY", "")
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is not set. Add it to your .env file.")

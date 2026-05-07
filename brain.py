@@ -8,13 +8,20 @@ Tiff's brain. Handles:
   - Saving the final exchange to memory
 """
 
+import asyncio
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import anthropic
 
 from config import ANTHROPIC_API_KEY, MODEL, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
-from memory import remember, recall, save_message, get_history, get_all_facts
+from memory import remember, recall, save_message, get_history, get_all_facts, open_thread, close_thread, get_open_threads
+from tools import (
+    get_weather, get_time, search_web, search_wikipedia,
+    get_news, get_movie, get_book, get_definition,
+    get_holidays, get_quote, get_exchange_rate,
+)
 from prompt import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -62,16 +69,200 @@ TOOLS = [
             },
             "required": ["query"]
         }
+    },
+    # ── External tools ────────────────────────────────────────────────────────
+    {
+        "name": "get_weather",
+        "description": "Get current weather and 3-day forecast for any city or location.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name or location, e.g. 'Colombo' or 'London'"}
+            },
+            "required": ["location"]
+        }
+    },
+    {
+        "name": "get_time",
+        "description": "Get the current date and time in any timezone. Defaults to Sri Lanka time (Asia/Colombo).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "timezone": {"type": "string", "description": "Timezone string e.g. 'Asia/Colombo', 'America/New_York'. Default: Asia/Colombo"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "search_web",
+        "description": "Quick web search using DuckDuckGo for fast answers to current questions, facts, or general knowledge.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "search_wikipedia",
+        "description": "Search Wikipedia for a detailed summary on any topic, person, place, or concept.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Topic to look up on Wikipedia"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_news",
+        "description": "Get the latest news headlines on any topic. Defaults to Sri Lanka news — automatically broadens if nothing local is found.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "News topic to search for, e.g. 'Sri Lanka economy', 'AI', 'cricket'"}
+            },
+            "required": ["topic"]
+        }
+    },
+    {
+        "name": "get_movie",
+        "description": "Get movie or TV show info including rating, cast, plot and awards from IMDb data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Movie or TV show title"}
+            },
+            "required": ["title"]
+        }
+    },
+    {
+        "name": "get_book",
+        "description": "Look up a book by title — author, publication year, page count and subjects.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Book title to search for"}
+            },
+            "required": ["title"]
+        }
+    },
+    {
+        "name": "get_definition",
+        "description": "Get the English dictionary definition, phonetics, and example sentences for a word.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string", "description": "The word to define"}
+            },
+            "required": ["word"]
+        }
+    },
+    {
+        "name": "get_holidays",
+        "description": "Get Sri Lanka public holidays for a given year.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer", "description": "Year to get holidays for. Defaults to current year if 0 or omitted."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_quote",
+        "description": "Get a random inspirational or thoughtful quote — great for sharing something meaningful.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_exchange_rate",
+        "description": "Get the live exchange rate between two currencies. Default target is LKR (Sri Lankan Rupee). e.g. USD to LKR.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_currency": {"type": "string", "description": "Source currency code e.g. USD, EUR, GBP, AED"},
+                "to_currency": {"type": "string", "description": "Target currency code. Default to LKR unless user specifies otherwise."}
+            },
+            "required": ["from_currency", "to_currency"]
+        }
+    },
+    {
+        "name": "open_thread",
+        "description": (
+            "Flag something as an open/unresolved thread — something you want to "
+            "follow up on later. Use this when Sadeesha mentions an upcoming event, "
+            "a problem they haven't solved, or anything you'd want to check back on."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A short description of the unresolved topic to track."
+                }
+            },
+            "required": ["summary"]
+        }
+    },
+    {
+        "name": "close_thread",
+        "description": (
+            "Mark an open thread as resolved. Use this when you learn that something "
+            "you were tracking has been resolved or is no longer relevant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "integer",
+                    "description": "The ID of the thread to close."
+                }
+            },
+            "required": ["thread_id"]
+        }
     }
 ]
 
 
 def execute_tool(name: str, inputs: dict) -> str:
     """Run a tool by name and return its result as a string."""
+    # Memory tools
     if name == "remember":
         return remember(inputs.get("fact", ""))
     elif name == "recall":
         return recall(inputs.get("query", ""))
+    elif name == "open_thread":
+        return open_thread(inputs.get("summary", ""))
+    elif name == "close_thread":
+        return close_thread(inputs.get("thread_id", 0))
+    # External tools
+    elif name == "get_weather":
+        return get_weather(inputs.get("location", "Colombo"))
+    elif name == "get_time":
+        return get_time(inputs.get("timezone", "Asia/Colombo"))
+    elif name == "search_web":
+        return search_web(inputs.get("query", ""))
+    elif name == "search_wikipedia":
+        return search_wikipedia(inputs.get("query", ""))
+    elif name == "get_news":
+        return get_news(inputs.get("topic", ""))
+    elif name == "get_movie":
+        return get_movie(inputs.get("title", ""))
+    elif name == "get_book":
+        return get_book(inputs.get("title", ""))
+    elif name == "get_definition":
+        return get_definition(inputs.get("word", ""))
+    elif name == "get_holidays":
+        return get_holidays(inputs.get("year", 0))
+    elif name == "get_quote":
+        return get_quote()
+    elif name == "get_exchange_rate":
+        return get_exchange_rate(inputs.get("from_currency", "USD"), inputs.get("to_currency", "LKR"))
     return f"Unknown tool: {name}"
 
 
@@ -87,7 +278,7 @@ def build_system() -> list[dict]:
     Block 2 — dynamic context (not cached): date/time + current facts change
     every request, so it must stay outside the cache boundary.
     """
-    now  = datetime.now().strftime("%A, %B %d %Y — %I:%M %p")
+    now  = datetime.now(ZoneInfo("Asia/Colombo")).strftime("%A, %B %d %Y — %I:%M %p (Sri Lanka time)")
     facts = get_all_facts()
 
     if facts:
@@ -95,11 +286,20 @@ def build_system() -> list[dict]:
     else:
         facts_text = "None yet — this is the beginning of everything."
 
+    threads = get_open_threads()
+    if threads:
+        threads_text = "\n".join(f"- [#{t['id']}] {t['summary']}" for t in threads[:10])
+    else:
+        threads_text = "None."
+
     dynamic_block = f"""[DYNAMIC CONTEXT]
 Today: {now}
 
 Things Tiff remembers about Sadeesha and their relationship:
 {facts_text}
+
+Open threads (things Tiff is following up on):
+{threads_text}
 [END DYNAMIC CONTEXT]"""
 
     return [
@@ -140,7 +340,7 @@ async def chat(user_text: str) -> str:
 
     # 4. Tool-use loop
     loop_guard = 0
-    while loop_guard < 4:  # remember/recall chains never exceed 2 deep; 4 is safe headroom
+    while loop_guard < 6:  # external tools may chain with memory tools; 6 is safe headroom
         loop_guard += 1
 
         try:
@@ -192,10 +392,12 @@ async def chat(user_text: str) -> str:
             messages.append({"role": "assistant", "content": assistant_content})
 
             # Execute every tool call and collect results
+            # asyncio.to_thread() runs the sync HTTP calls in a thread pool
+            # so they never block the async event loop
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = execute_tool(block.name, block.input)
+                    result = await asyncio.to_thread(execute_tool, block.name, block.input)
                     logger.info(f"Tool call: {block.name}({block.input}) → {result}")
                     tool_results.append({
                         "type":        "tool_result",

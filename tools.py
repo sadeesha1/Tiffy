@@ -347,14 +347,14 @@ def translate_to_sinhala(text: str) -> str:
 
 def get_local_news(source: str = "all") -> str:
     """
-    Latest Sri Lanka news from Ada Derana and Daily Mirror RSS feeds.
-    source: "adaderana", "dailymirror", or "all" (default)
+    Latest Sri Lanka news from Ada Derana and The Island RSS feeds.
+    source: "adaderana", "island", or "all" (default)
     """
     import xml.etree.ElementTree as ET
 
     feeds = {
-        "adaderana":   "https://www.adaderana.lk/rss.php",
-        "dailymirror": "https://www.dailymirror.lk/rss",
+        "adaderana": "https://www.adaderana.lk/rss.php",
+        "island":    "https://island.lk/feed/",
     }
 
     src = source.strip().lower()
@@ -368,7 +368,15 @@ def get_local_news(source: str = "all") -> str:
     all_items = []
     for feed_name, url in targets:
         try:
-            r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=TIMEOUT, follow_redirects=True)
+            r = httpx.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                },
+                timeout=TIMEOUT,
+                follow_redirects=True,
+            )
             r.raise_for_status()
             root = ET.fromstring(r.text)
             channel = root.find("channel")

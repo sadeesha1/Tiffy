@@ -71,6 +71,8 @@ check("get_movie(Interstellar)",        lambda: get_movie("Interstellar"))
 # ── New tools ────────────────────────────────────────────────────────────────
 check("get_local_news(all)",            lambda: get_local_news("all"))
 check("get_local_news(adaderana)",      lambda: get_local_news("adaderana"))
+check("get_local_news(island)",         lambda: get_local_news("island"))
+check("brain._is_complex_query(news)",  lambda: __import__("brain")._is_complex_query("latest news on cricket"))
 check("calculate(simple)",             lambda: calculate("2 + 2"))
 check("calculate(complex)",            lambda: calculate("sqrt(144) + round(3.7)"))
 check("calculate(formula)",            lambda: calculate("(1200 * 0.18) / 12"))

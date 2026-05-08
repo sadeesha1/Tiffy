@@ -40,6 +40,7 @@ client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # Keywords that signal the user wants deep thinking, not a quick reply
 _COMPLEX_KEYWORDS = [
+    # Reasoning / analysis
     "why", "how does", "how do", "explain", "analyze", "analyse",
     "compare", "difference between", "what do you think", "your opinion",
     "should i", "help me decide", "is it worth", "better option",
@@ -48,6 +49,15 @@ _COMPLEX_KEYWORDS = [
     "walk me through", "help me understand", "critique", "review",
     "evaluate", "what's wrong", "why isn't", "how can i improve",
     "think about", "thoughts on", "feedback on",
+    # News / factual lookups — these need synthesis across tool results,
+    # which haiku does poorly. Safe to route up because they're not personal.
+    "latest news", "news about", "news on", "news around",
+    "what happened", "what's happening", "whats happening",
+    "any news", "any updates", "update on", "updates on",
+    "tell me about", "tell me what", "what is the latest",
+    "what are the latest", "info on", "information about",
+    "current status", "recent news", "what's going on with",
+    "latest on", "anything new about",
 ]
 
 
@@ -413,7 +423,7 @@ TOOLS = [
     {
         "name": "get_local_news",
         "description": (
-            "Get the latest Sri Lanka news from Ada Derana and Daily Mirror RSS feeds. "
+            "Get the latest Sri Lanka news from Ada Derana and The Island RSS feeds. "
             "Use this for local Sri Lanka news, breaking news, or when he asks what's happening in Sri Lanka."
         ),
         "input_schema": {
@@ -421,7 +431,7 @@ TOOLS = [
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "News source: 'adaderana', 'dailymirror', or 'all' (default). Use 'all' unless he asks for a specific source."
+                    "description": "News source: 'adaderana', 'island', or 'all' (default). Use 'all' unless he asks for a specific source."
                 }
             },
             "required": []

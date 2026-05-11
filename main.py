@@ -34,6 +34,7 @@ from memory import (
     get_due_reminders, mark_reminder_sent,
     save_setting, get_setting,
     get_reminders_for_today,
+    purge_facts_by_keyword, get_owner_profile, get_learnings,
 )
 from brain import chat, set_backend, get_backend
 
@@ -531,6 +532,61 @@ async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{result} 🤍")
 
 
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/profile — Show a structured view of what Tiff knows about you."""
+    if not is_authorized(update):
+        return
+    profile = get_owner_profile()
+    await update.message.reply_text(profile)
+
+
+async def cmd_cleanmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleanmemory [keyword] — Clean up junk facts. No keyword = clean smoke-test data."""
+    if not is_authorized(update):
+        return
+
+    args = context.args
+    if args:
+        keyword = " ".join(args)
+    else:
+        keyword = "smoke test"
+
+    deleted = purge_facts_by_keyword(keyword)
+    if deleted:
+        await update.message.reply_text(
+            f"🧹 deleted {deleted} fact(s) containing '{keyword}'"
+        )
+    else:
+        await update.message.reply_text(
+            f"nothing found containing '{keyword}' 🤍"
+        )
+
+
+async def cmd_learnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/learnings — Show what Tiff has learned from your messages (pending promotion)."""
+    if not is_authorized(update):
+        return
+
+    items = get_learnings(limit=25)
+    if not items:
+        await update.message.reply_text("no learnings captured yet — keep chatting 🩷")
+        return
+
+    by_cat: dict[str, list] = {}
+    for l in items:
+        by_cat.setdefault(l["category"], []).append(l)
+
+    em = {"preference": "❤️", "aversion": "❌", "habit": "🔄", "correction": "📝"}
+    lines = ["what tiff is learning about you 🧠", ""]
+    for cat, ls in by_cat.items():
+        lines.append(f"{em.get(cat, '•')} {cat}s:")
+        for l in ls[:5]:
+            star = " ⭐" if l["recurrence"] >= 2 else ""
+            lines.append(f"  • {l['content'][:70]}{star}")
+    lines.append(f"\n(⭐ = seen 2+ times, promotes to core fact at 3×)")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_backend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/backend [claude|ollama] — Show or switch the active AI backend."""
     if not is_authorized(update):
@@ -575,6 +631,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/memory — see what tiff remembers\n"
         "/threads — see open threads tiff is tracking\n"
         "/resolve <id> — close a thread\n"
+        "/profile — see what tiff knows about you\n"
+        "/learnings — see what tiff is learning from your messages\n"
+        "/cleanmemory [keyword] — delete junk facts\n"
         "/backend [claude|ollama] — switch AI backend\n"
         "/clear — clear chat history (keeps memories)\n"
         "/reset — clear everything (nuclear)\n"
@@ -600,8 +659,11 @@ def main():
     app.add_handler(CommandHandler("resolve", cmd_resolve))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("backend", cmd_backend))
-    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("profile",     cmd_profile))
+    app.add_handler(CommandHandler("cleanmemory", cmd_cleanmemory))
+    app.add_handler(CommandHandler("learnings",   cmd_learnings))
+    app.add_handler(CommandHandler("backend",     cmd_backend))
+    app.add_handler(CommandHandler("help",        cmd_help))
 
     # Main message handler (text only, ignores commands)
     app.add_handler(

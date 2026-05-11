@@ -123,6 +123,18 @@ def init_db():
                 logged_at  TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS learnings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                category    TEXT    NOT NULL,
+                content     TEXT    NOT NULL,
+                fingerprint TEXT    NOT NULL,
+                recurrence  INTEGER DEFAULT 1,
+                promoted    INTEGER DEFAULT 0,
+                created_at  TEXT    DEFAULT (datetime('now')),
+                last_seen   TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
     try:
         _init_vector_db()
@@ -598,3 +610,259 @@ def clear_all():
         )
     except Exception:
         pass
+
+
+# ── Self-learning: signal extraction ─────────────────────────────────────────
+
+_PREFERENCE_TRIGGERS = [
+    "i like ", "i love ", "i enjoy ", "i adore ", "i prefer ",
+    "my favorite ", "my favourite ", "i really like ", "i really love ",
+]
+_AVERSION_TRIGGERS = [
+    "i hate ", "i dislike ", "i can't stand ", "i cant stand ",
+    "i don't like ", "i dont like ", "i never want ",
+]
+_HABIT_TRIGGERS = [
+    "i always ", "i usually ", "i typically ", "i normally ",
+    "every morning ", "every night ", "every day ", "every week ",
+]
+_CORRECTION_STARTS = [
+    "no,", "no.", "no!", "no that", "actually,", "actually.", "actually i",
+    "that's wrong", "thats wrong", "you're wrong", "you got it wrong",
+    "that's not right", "thats not right", "i said ",
+]
+
+
+def _extract_signals_from_text(text: str) -> list[tuple[str, str]]:
+    """
+    Pure Python signal extraction from a user message.
+    Returns a list of (category, content) tuples.
+    Zero cost — no LLM calls, no network.
+
+    Categories: preference, aversion, habit, correction
+    """
+    tl   = text.lower().strip()
+    results: list[tuple[str, str]] = []
+
+    def _clip_after(trigger: str, max_len: int = 70) -> str | None:
+        """Extract text after a trigger phrase, trimmed at sentence boundary."""
+        idx = tl.find(trigger)
+        if idx == -1:
+            return None
+        start   = idx + len(trigger)
+        snippet = text[start : start + max_len]  # preserve original case
+        for sep in [".", "!", "?", "\n"]:
+            p = snippet.find(sep)
+            if p > 4:
+                snippet = snippet[:p]
+                break
+        return snippet.strip()
+
+    for trigger in _PREFERENCE_TRIGGERS:
+        part = _clip_after(trigger)
+        if part and 4 < len(part) < 65:
+            verb = trigger.strip().replace("my ", "his ").replace("i ", "he ")
+            results.append(("preference", f"Sadeesha {verb} {part}"))
+
+    for trigger in _AVERSION_TRIGGERS:
+        part = _clip_after(trigger)
+        if part and 4 < len(part) < 65:
+            results.append(("aversion", f"Sadeesha dislikes: {part}"))
+
+    for trigger in _HABIT_TRIGGERS:
+        part = _clip_after(trigger)
+        if part and 4 < len(part) < 65:
+            results.append(("habit", f"Sadeesha's habit: {trigger.strip()} {part}"))
+
+    if any(tl.startswith(t) for t in _CORRECTION_STARTS) and len(text) > 15:
+        snippet = text[:100].replace("\n", " ")
+        results.append(("correction", f"Correction from Sadeesha: {snippet}"))
+
+    return results
+
+
+# ── Self-learning: capture, deduplicate, promote ──────────────────────────────
+
+_PROMOTION_THRESHOLD = 3  # recurrences before auto-promoting to core facts
+
+
+def _fingerprint(content: str) -> str:
+    """Normalised short key used for deduplication."""
+    import re
+    s = content.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+    return " ".join(s.split()[:8])  # first 8 words, normalised
+
+
+def capture_learning(category: str, content: str) -> str:
+    """
+    Save a learning signal to the learnings table.
+    If a similar entry already exists, increment its recurrence count.
+    When recurrence hits _PROMOTION_THRESHOLD, auto-promote to core facts.
+    Returns a short status string.
+    """
+    fp = _fingerprint(content)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            existing = conn.execute(
+                "SELECT id, recurrence, promoted FROM learnings WHERE fingerprint=?",
+                (fp,)
+            ).fetchone()
+
+            if existing:
+                rec_id, old_rec, already_promoted = existing
+                new_rec = old_rec + 1
+                conn.execute(
+                    "UPDATE learnings SET recurrence=?, last_seen=datetime('now') WHERE id=?",
+                    (new_rec, rec_id)
+                )
+                conn.commit()
+                if new_rec >= _PROMOTION_THRESHOLD and not already_promoted:
+                    _promote_learning_by_id(rec_id, content)
+                    return f"promoted ({new_rec}x)"
+                return f"updated ({new_rec}x)"
+            else:
+                conn.execute(
+                    "INSERT INTO learnings (category, content, fingerprint) VALUES (?,?,?)",
+                    (category, content, fp)
+                )
+                conn.commit()
+                return "new"
+    except Exception as e:
+        logger.warning(f"capture_learning error: {e}")
+        return "error"
+
+
+def _promote_learning_by_id(learning_id: int, content: str):
+    """Promote a learning to core facts table (and vector index)."""
+    try:
+        # Add to facts
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute("INSERT INTO facts (content) VALUES (?)", (content,))
+            new_id = cursor.lastrowid
+            conn.execute("UPDATE learnings SET promoted=1 WHERE id=?", (learning_id,))
+            conn.commit()
+        # Index in Qdrant
+        try:
+            from qdrant_client import models as qm
+            vector = next(_get_embedder().embed([content])).tolist()
+            _get_qdrant().upsert(
+                collection_name=COLLECTION,
+                points=[qm.PointStruct(id=new_id, vector=vector, payload={"content": content})],
+            )
+        except Exception:
+            pass
+        logger.info(f"Learning promoted to fact: {content[:60]}")
+    except Exception as e:
+        logger.warning(f"Learning promotion failed: {e}")
+
+
+def get_learnings(category: str | None = None, limit: int = 30) -> list[dict]:
+    """Return learnings, optionally filtered by category, ordered by recurrence."""
+    with sqlite3.connect(DB_PATH) as conn:
+        if category:
+            rows = conn.execute(
+                "SELECT id, category, content, recurrence, promoted, created_at "
+                "FROM learnings WHERE category=? AND promoted=0 ORDER BY recurrence DESC LIMIT ?",
+                (category, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, category, content, recurrence, promoted, created_at "
+                "FROM learnings WHERE promoted=0 ORDER BY recurrence DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+    return [
+        {"id": r[0], "category": r[1], "content": r[2],
+         "recurrence": r[3], "promoted": r[4], "created_at": r[5]}
+        for r in rows
+    ]
+
+
+# ── Memory hygiene ────────────────────────────────────────────────────────────
+
+def purge_facts_by_keyword(keyword: str) -> int:
+    """
+    Delete all facts whose content contains keyword (case-insensitive).
+    Also removes from the Qdrant vector index.
+    Returns the number of facts deleted.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [
+            r[0] for r in conn.execute(
+                "SELECT id FROM facts WHERE LOWER(content) LIKE ?",
+                (f"%{keyword.lower()}%",)
+            ).fetchall()
+        ]
+        if not ids:
+            return 0
+        conn.execute(
+            f"DELETE FROM facts WHERE id IN ({','.join('?'*len(ids))})", ids
+        )
+        conn.commit()
+
+    try:
+        _get_qdrant().delete(
+            collection_name=COLLECTION,
+            points_selector=ids,
+        )
+    except Exception:
+        pass
+
+    return len(ids)
+
+
+# ── Owner profile ─────────────────────────────────────────────────────────────
+
+def get_owner_profile() -> str:
+    """
+    Build a structured, human-readable profile of what Tiff knows about Sadeesha.
+    Used by the /profile command.
+    """
+    facts = get_all_facts()
+    learnings = get_learnings(limit=50)
+
+    by_category: dict[str, list[str]] = {}
+    for l in learnings:
+        by_category.setdefault(l["category"], []).append(
+            f"{l['content']}  (seen {l['recurrence']}×)"
+        )
+
+    emoji_map = {
+        "preference": "❤️",
+        "aversion":   "❌",
+        "habit":      "🔄",
+        "correction": "📝",
+        "interest":   "✨",
+        "context":    "📍",
+    }
+
+    lines = ["what tiff knows about sadeesha 🤍", ""]
+
+    # Core facts
+    real_facts = [f for f in facts if "smoke test" not in f.lower()]
+    if real_facts:
+        lines.append(f"📌 core facts ({len(real_facts)}):")
+        for f in real_facts[:20]:
+            lines.append(f"  • {f}")
+    else:
+        lines.append("📌 core facts: none yet")
+
+    # Learnings by category
+    for cat, items in by_category.items():
+        em = emoji_map.get(cat, "•")
+        lines.append(f"\n{em} {cat}s ({len(items)}):")
+        for item in items[:6]:
+            lines.append(f"  • {item}")
+
+    # Mood
+    mood = get_mood_trend(30)
+    if mood:
+        lines.append(f"\n📊 {mood}")
+
+    # Stats
+    total_learnings = sum(len(v) for v in by_category.values())
+    lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"  {len(real_facts)} facts  |  {total_learnings} learnings pending")
+
+    return "\n".join(lines)

@@ -31,6 +31,7 @@ from memory import (
     open_thread, close_thread, get_open_threads, maybe_summarise_history,
     set_reminder, remember_person, get_person, save_note, search_notes,
     log_mood, get_mood_trend, get_setting, save_setting,
+    capture_learning, _extract_signals_from_text,
 )
 from tools import (
     get_weather, get_sl_weather_summary, get_time, search_web, search_wikipedia,
@@ -144,6 +145,20 @@ def _is_complex_query(text: str) -> bool:
         return False
     tl = text.lower()
     return any(kw in tl for kw in _COMPLEX_KEYWORDS)
+
+
+def _process_user_signals(text: str):
+    """
+    Extract self-learning signals from a user message and save them.
+    Runs in a background thread — zero cost, zero latency impact.
+    """
+    signals = _extract_signals_from_text(text)
+    for category, content in signals:
+        try:
+            status = capture_learning(category, content)
+            logger.debug(f"Signal [{category}] {status}: {content[:55]}")
+        except Exception as e:
+            logger.warning(f"Signal capture failed: {e}")
 
 
 def _route(user_text: str) -> tuple[str, dict | None, int]:
@@ -648,6 +663,8 @@ def build_system_flat(auto_recall: str = "") -> str:
 async def _chat_claude(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
     """Process one message through the Anthropic Claude backend."""
     save_message("user", user_text)
+    # Self-learning: extract preference/habit/correction signals in background
+    asyncio.create_task(asyncio.to_thread(_process_user_signals, user_text))
     auto_mem = await asyncio.to_thread(recall, user_text)
     messages = get_history(limit=MAX_HISTORY_TURNS)
 
@@ -741,6 +758,8 @@ async def _chat_ollama(user_text: str, image_b64: str | None = None, media_type:
     OpenAI-compatible model). Uses standard function-calling format.
     """
     save_message("user", user_text)
+    # Self-learning: extract preference/habit/correction signals in background
+    asyncio.create_task(asyncio.to_thread(_process_user_signals, user_text))
     auto_mem = await asyncio.to_thread(recall, user_text)
 
     system_text = build_system_flat(auto_recall=auto_mem)

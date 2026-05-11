@@ -58,10 +58,13 @@ _active_backend: str = _load_backend()
 
 def set_backend(backend: str) -> str:
     """Switch the active AI backend at runtime. Returns the new backend name."""
-    global _active_backend
+    global _active_backend, _ollama_client, _claude_client
     if backend not in ("claude", "ollama"):
         return f"unknown backend '{backend}' — use 'claude' or 'ollama'"
     _active_backend = backend
+    # Reset clients so they re-init with fresh env vars on next use
+    _ollama_client = None
+    _claude_client = None
     save_setting("ai_backend", backend)
     logger.info(f"AI backend switched to: {backend}")
     return backend
@@ -88,10 +91,12 @@ def _get_ollama_client():
     global _ollama_client
     if _ollama_client is None:
         from openai import AsyncOpenAI
-        _ollama_client = AsyncOpenAI(
-            base_url=OLLAMA_BASE_URL,
-            api_key=OLLAMA_API_KEY or "ollama",
-        )
+        # Re-read from env in case .env was updated after process started
+        import os
+        base_url = os.getenv("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+        api_key  = os.getenv("OLLAMA_API_KEY",  OLLAMA_API_KEY) or "ollama"
+        logger.info(f"Ollama client init → base_url={base_url}")
+        _ollama_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     return _ollama_client
 
 
@@ -781,8 +786,16 @@ async def _chat_ollama(user_text: str, image_b64: str | None = None, media_type:
                 temperature=0.75,
             )
         except Exception as e:
-            logger.error(f"Ollama API error: {e}")
-            return "something went wrong on my end love 🥺 is ollama running?"
+            err_str = str(e)
+            logger.error(f"Ollama API error ({type(e).__name__}): {err_str}")
+            # Surface useful hints based on error type
+            if "401" in err_str or "unauthorized" in err_str.lower() or "api key" in err_str.lower():
+                return "ollama auth failed 🥺 check your OLLAMA_API_KEY in .env"
+            if "404" in err_str or "not found" in err_str.lower():
+                return f"model not found on ollama cloud 🥺 check OLLAMA_MODEL in .env (got: {model})"
+            if "connect" in err_str.lower() or "network" in err_str.lower() or "timeout" in err_str.lower():
+                return "can't reach ollama cloud right now 🥺 check your internet connection?"
+            return f"ollama error: {err_str[:120]} 🥺"
 
         choice = response.choices[0]
         finish = choice.finish_reason

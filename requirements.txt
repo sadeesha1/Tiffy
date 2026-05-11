@@ -1,5 +1,6 @@
 python-telegram-bot==21.9
 anthropic>=0.40.0
+openai>=1.0.0
 python-dotenv>=1.0.0
 qdrant-client>=1.9.0
 fastembed>=0.8.0

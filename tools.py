@@ -400,6 +400,60 @@ def get_local_news(source: str = "all") -> str:
     return "\n".join(all_items) if all_items else "No local news available right now."
 
 
+# ── Sri Lanka multi-city weather ─────────────────────────────────────────────
+
+_SL_CITIES = ["Colombo", "Kandy", "Galle", "Jaffna", "Negombo", "Nuwara Eliya"]
+
+def get_sl_weather_summary(cities: str = "all") -> str:
+    """
+    Get a weather snapshot for multiple Sri Lankan cities.
+    cities: comma-separated names, or "all" for the 6 major cities.
+    """
+    if cities.strip().lower() == "all":
+        targets = _SL_CITIES
+    else:
+        targets = [c.strip() for c in cities.split(",") if c.strip()]
+
+    lines = ["Sri Lanka weather snapshot:"]
+    for city in targets[:6]:  # cap at 6 to stay fast
+        try:
+            geo = _get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                name=f"{city}, Sri Lanka", count=1, language="en", format="json"
+            )
+            if not geo or not geo.get("results"):
+                lines.append(f"  {city}: location not found")
+                continue
+            place = geo["results"][0]
+            lat, lon = place["latitude"], place["longitude"]
+
+            data = _get(
+                "https://api.open-meteo.com/v1/forecast",
+                latitude=lat, longitude=lon,
+                current="temperature_2m,weather_code,relative_humidity_2m",
+                timezone="auto", forecast_days=1
+            )
+            if not data:
+                lines.append(f"  {city}: weather unavailable")
+                continue
+
+            c = data["current"]
+            wmo = {
+                0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+                45: "Foggy", 51: "Light drizzle", 61: "Light rain", 63: "Moderate rain",
+                65: "Heavy rain", 80: "Rain showers", 95: "Thunderstorm"
+            }
+            cond = wmo.get(c.get("weather_code", 0), "")
+            lines.append(
+                f"  {city}: {c['temperature_2m']}°C, {cond}, "
+                f"humidity {c['relative_humidity_2m']}%"
+            )
+        except Exception as e:
+            lines.append(f"  {city}: error ({e})")
+
+    return "\n".join(lines)
+
+
 # ── Calculator ────────────────────────────────────────────────────────────────
 
 def calculate(expression: str) -> str:

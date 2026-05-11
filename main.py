@@ -35,7 +35,7 @@ from memory import (
     save_setting, get_setting,
     get_reminders_for_today,
 )
-from brain import chat
+from brain import chat, set_backend, get_backend
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -531,6 +531,39 @@ async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{result} 🤍")
 
 
+async def cmd_backend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backend [claude|ollama] — Show or switch the active AI backend."""
+    if not is_authorized(update):
+        return
+
+    args = context.args
+    if not args:
+        current = get_backend()
+        await update.message.reply_text(
+            f"active backend: {current} 🤖\n\n"
+            f"switch with:\n  /backend ollama\n  /backend claude"
+        )
+        return
+
+    target = args[0].lower().strip()
+    if target not in ("claude", "ollama"):
+        await update.message.reply_text(
+            "use '/backend ollama' or '/backend claude' 🥺"
+        )
+        return
+
+    set_backend(target)
+
+    labels = {
+        "ollama": "Ollama (qwen3-coder-next) 🦙",
+        "claude": "Anthropic Claude 🤖",
+    }
+    await update.message.reply_text(
+        f"switched to {labels[target]} ✨\n"
+        f"new messages will use this backend."
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/help — Show available commands."""
     if not is_authorized(update):
@@ -542,6 +575,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/memory — see what tiff remembers\n"
         "/threads — see open threads tiff is tracking\n"
         "/resolve <id> — close a thread\n"
+        "/backend [claude|ollama] — switch AI backend\n"
         "/clear — clear chat history (keeps memories)\n"
         "/reset — clear everything (nuclear)\n"
         "/help — this list"
@@ -566,6 +600,7 @@ def main():
     app.add_handler(CommandHandler("resolve", cmd_resolve))
     app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("backend", cmd_backend))
     app.add_handler(CommandHandler("help",    cmd_help))
 
     # Main message handler (text only, ignores commands)

@@ -3,19 +3,29 @@ brain.py
 --------
 Tiff's brain. Handles:
   - Building the full system prompt with dynamic context
-  - Calling the Claude API with tool-use support
-  - Running the tool-use loop until end_turn
+  - Calling the AI (Ollama or Claude) with tool-use support
+  - Running the tool-use loop until end_turn / stop
   - Saving the final exchange to memory
+
+Backend selection (switchable at runtime via /backend command):
+  AI_BACKEND="ollama"  → Ollama cloud/local via OpenAI-compatible API (default, free)
+  AI_BACKEND="claude"  → Anthropic Claude API (requires ANTHROPIC_API_KEY)
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, MODEL, FAST_MODEL, THINKING_BUDGET, MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT
+from config import (
+    ANTHROPIC_API_KEY, MODEL, FAST_MODEL, THINKING_BUDGET,
+    MAX_HISTORY_TURNS, MAX_FACTS_IN_CONTEXT,
+    OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_API_KEY,
+    AI_BACKEND as _DEFAULT_BACKEND,
+)
 from memory import (
     remember, recall, save_message, get_history, get_all_facts,
     open_thread, close_thread, get_open_threads, maybe_summarise_history,
@@ -23,7 +33,7 @@ from memory import (
     log_mood, get_mood_trend, get_setting, save_setting,
 )
 from tools import (
-    get_weather, get_time, search_web, search_wikipedia,
+    get_weather, get_sl_weather_summary, get_time, search_web, search_wikipedia,
     get_news, get_movie, get_book, get_definition,
     get_holidays, get_quote, get_exchange_rate,
     get_local_news, calculate,
@@ -32,13 +42,61 @@ from prompt import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# Async Anthropic client
-client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Backend management ────────────────────────────────────────────────────────
+
+def _load_backend() -> str:
+    """Load active backend from DB (runtime override) or fall back to config."""
+    try:
+        saved = get_setting("ai_backend")
+        return saved if saved in ("claude", "ollama") else _DEFAULT_BACKEND
+    except Exception:
+        return _DEFAULT_BACKEND
+
+_active_backend: str = _load_backend()
 
 
-# ── Query complexity routing ──────────────────────────────────────────────────
+def set_backend(backend: str) -> str:
+    """Switch the active AI backend at runtime. Returns the new backend name."""
+    global _active_backend
+    if backend not in ("claude", "ollama"):
+        return f"unknown backend '{backend}' — use 'claude' or 'ollama'"
+    _active_backend = backend
+    save_setting("ai_backend", backend)
+    logger.info(f"AI backend switched to: {backend}")
+    return backend
 
-# Keywords that signal the user wants deep thinking, not a quick reply
+
+def get_backend() -> str:
+    return _active_backend
+
+
+# ── Clients (lazy-init) ───────────────────────────────────────────────────────
+
+_claude_client: anthropic.AsyncAnthropic | None = None
+_ollama_client = None
+
+
+def _get_claude_client() -> anthropic.AsyncAnthropic:
+    global _claude_client
+    if _claude_client is None:
+        _claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude_client
+
+
+def _get_ollama_client():
+    global _ollama_client
+    if _ollama_client is None:
+        from openai import AsyncOpenAI
+        _ollama_client = AsyncOpenAI(
+            base_url=OLLAMA_BASE_URL,
+            api_key=OLLAMA_API_KEY or "ollama",
+        )
+    return _ollama_client
+
+
+# ── Query complexity routing (Claude backend only) ────────────────────────────
+
 _COMPLEX_KEYWORDS = [
     # Reasoning / analysis
     "why", "how does", "how do", "explain", "analyze", "analyse",
@@ -49,8 +107,7 @@ _COMPLEX_KEYWORDS = [
     "walk me through", "help me understand", "critique", "review",
     "evaluate", "what's wrong", "why isn't", "how can i improve",
     "think about", "thoughts on", "feedback on",
-    # News / factual lookups — these need synthesis across tool results,
-    # which haiku does poorly. Safe to route up because they're not personal.
+    # News / factual lookups — need synthesis across tool results
     "latest news", "news about", "news on", "news around",
     "what happened", "what's happening", "whats happening",
     "any news", "any updates", "update on", "updates on",
@@ -60,9 +117,6 @@ _COMPLEX_KEYWORDS = [
     "latest on", "anything new about",
 ]
 
-
-# Markers that signal an emotional/relational message — these route to haiku
-# regardless of length, so Tiff stays in character instead of going meta.
 _EMOTIONAL_MARKERS = [
     "i love you", "miss you", "hurt", "sorry", "alone", "lonely",
     "us", " we ", "you and i", "you and me", "between us",
@@ -75,20 +129,12 @@ _EMOTIONAL_MARKERS = [
 
 
 def _is_emotional(text: str) -> bool:
-    """True if the message is relational/emotional rather than analytical."""
     tl = text.lower()
     return any(marker in tl for marker in _EMOTIONAL_MARKERS)
 
 
 def _is_complex_query(text: str) -> bool:
-    """
-    True when the message warrants extended thinking.
-
-    Only triggers on explicit reasoning/analysis keywords, AND only if the
-    message isn't emotional in tone. Long emotional messages stay on haiku
-    so Tiff stays in character — sonnet's safety training is more likely to
-    surface as fourth-wall breaks and therapy-speak on personal turns.
-    """
+    """True when message warrants extended thinking — analytical, not emotional."""
     if _is_emotional(text):
         return False
     tl = text.lower()
@@ -96,19 +142,14 @@ def _is_complex_query(text: str) -> bool:
 
 
 def _route(user_text: str) -> tuple[str, dict | None, int]:
-    """
-    Return (model, thinking_config, max_tokens) for this message.
-
-    Complex queries → sonnet + extended thinking.
-    Casual messages → haiku, no thinking, capped tokens (faster + cheaper).
-    """
+    """Return (model, thinking_config, max_tokens) for Claude routing."""
     if _is_complex_query(user_text) and THINKING_BUDGET > 0:
         thinking = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
         return MODEL, thinking, THINKING_BUDGET + 2048
     return FAST_MODEL, None, 768
 
 
-# ── Tool definitions ──────────────────────────────────────────────────────────
+# ── Tool definitions (Anthropic format — source of truth) ────────────────────
 
 TOOLS = [
     {
@@ -122,10 +163,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "fact": {
-                    "type": "string",
-                    "description": "The fact or memory to save, written clearly."
-                }
+                "fact": {"type": "string", "description": "The fact or memory to save, written clearly."}
             },
             "required": ["fact"]
         }
@@ -140,15 +178,11 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "What to search for in memory."
-                }
+                "query": {"type": "string", "description": "What to search for in memory."}
             },
             "required": ["query"]
         }
     },
-    # ── External tools ────────────────────────────────────────────────────────
     {
         "name": "get_weather",
         "description": "Get current weather and 3-day forecast for any city or location.",
@@ -158,6 +192,27 @@ TOOLS = [
                 "location": {"type": "string", "description": "City name or location, e.g. 'Colombo' or 'London'"}
             },
             "required": ["location"]
+        }
+    },
+    {
+        "name": "get_sl_weather_summary",
+        "description": (
+            "Get weather for multiple Sri Lankan cities at once. Perfect for "
+            "'weather around Sri Lanka', 'how's the weather across the island', "
+            "or travel planning. Returns a city-by-city snapshot."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cities": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated city names, or 'all' for the 6 major cities "
+                        "(Colombo, Kandy, Galle, Jaffna, Negombo, Nuwara Eliya). Default: 'all'."
+                    )
+                }
+            },
+            "required": []
         }
     },
     {
@@ -173,7 +228,7 @@ TOOLS = [
     },
     {
         "name": "search_web",
-        "description": "Quick web search using DuckDuckGo for fast answers to current questions, facts, or general knowledge.",
+        "description": "Quick web search using DuckDuckGo for current events, facts, or general knowledge.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -195,11 +250,11 @@ TOOLS = [
     },
     {
         "name": "get_news",
-        "description": "Get the latest news headlines on any topic. Defaults to Sri Lanka news — automatically broadens if nothing local is found.",
+        "description": "Get the latest news headlines on any topic. Defaults to Sri Lanka news if no topic given.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "News topic to search for, e.g. 'Sri Lanka economy', 'AI', 'cricket'"}
+                "topic": {"type": "string", "description": "News topic e.g. 'Sri Lanka economy', 'AI', 'cricket'"}
             },
             "required": ["topic"]
         }
@@ -243,14 +298,14 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "year": {"type": "integer", "description": "Year to get holidays for. Defaults to current year if 0 or omitted."}
+                "year": {"type": "integer", "description": "Year. Defaults to current year if 0 or omitted."}
             },
             "required": []
         }
     },
     {
         "name": "get_quote",
-        "description": "Get a random inspirational or thoughtful quote — great for sharing something meaningful.",
+        "description": "Get a random inspirational or thoughtful quote.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -259,12 +314,12 @@ TOOLS = [
     },
     {
         "name": "get_exchange_rate",
-        "description": "Get the live exchange rate between two currencies. Default target is LKR (Sri Lankan Rupee). e.g. USD to LKR.",
+        "description": "Get the live exchange rate between two currencies. Default target is LKR (Sri Lankan Rupee).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "from_currency": {"type": "string", "description": "Source currency code e.g. USD, EUR, GBP, AED"},
-                "to_currency": {"type": "string", "description": "Target currency code. Default to LKR unless user specifies otherwise."}
+                "to_currency":   {"type": "string", "description": "Target currency code. Default to LKR unless user specifies otherwise."}
             },
             "required": ["from_currency", "to_currency"]
         }
@@ -272,34 +327,24 @@ TOOLS = [
     {
         "name": "open_thread",
         "description": (
-            "Flag something as an open/unresolved thread — something you want to "
-            "follow up on later. Use this when Sadeesha mentions an upcoming event, "
-            "a problem they haven't solved, or anything you'd want to check back on."
+            "Flag something as an open/unresolved thread — something to follow up on. "
+            "Use when Sadeesha mentions an upcoming event, unsolved problem, or anything to check back on."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "A short description of the unresolved topic to track."
-                }
+                "summary": {"type": "string", "description": "Short description of the unresolved topic."}
             },
             "required": ["summary"]
         }
     },
     {
         "name": "close_thread",
-        "description": (
-            "Mark an open thread as resolved. Use this when you learn that something "
-            "you were tracking has been resolved or is no longer relevant."
-        ),
+        "description": "Mark an open thread as resolved.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "thread_id": {
-                    "type": "integer",
-                    "description": "The ID of the thread to close."
-                }
+                "thread_id": {"type": "integer", "description": "The ID of the thread to close."}
             },
             "required": ["thread_id"]
         }
@@ -307,47 +352,33 @@ TOOLS = [
     {
         "name": "set_reminder",
         "description": (
-            "Set a reminder to notify Sadeesha at a specific time. Use this whenever "
-            "she mentions an upcoming event, appointment, deadline, or asks to be "
-            "reminded about something. Set remind_at to 20 minutes BEFORE the event "
-            "so she gets a heads-up. The current Sri Lanka date and time is always "
-            "shown in your dynamic context — use it to calculate the correct datetime."
+            "Set a reminder for Sadeesha at a specific time. Set remind_at 20 minutes BEFORE the event. "
+            "The current Sri Lanka time is in your dynamic context — use it to calculate the correct datetime."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "Short description of what to remind about, e.g. 'Doctor appointment' or 'Call with Kamal'."
-                },
-                "remind_at": {
-                    "type": "string",
-                    "description": "When to send the reminder — ISO 8601 format in Sri Lanka time: YYYY-MM-DDTHH:MM:SS. Set this 20 minutes before the actual event."
-                }
+                "message":   {"type": "string", "description": "What to remind about e.g. 'Doctor appointment'."},
+                "remind_at": {"type": "string", "description": "ISO 8601 Sri Lanka time: YYYY-MM-DDTHH:MM:SS."}
             },
             "required": ["message", "remind_at"]
         }
     },
-    # ── Relationship memory ───────────────────────────────────────────────────
     {
         "name": "remember_person",
-        "description": (
-            "Save or update information about a specific person Sadeesha mentions — "
-            "a friend, family member, colleague, or anyone who comes up in conversation. "
-            "Use this to keep track of who matters to him and what you know about them."
-        ),
+        "description": "Save or update information about a specific person Sadeesha mentions.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "name":    {"type": "string", "description": "The person's name."},
-                "details": {"type": "string", "description": "What to remember about them — relationship, personality, recent events, etc."}
+                "details": {"type": "string", "description": "What to remember — relationship, personality, recent events, etc."}
             },
             "required": ["name", "details"]
         }
     },
     {
         "name": "get_person",
-        "description": "Look up everything you know about a specific person by name.",
+        "description": "Look up everything Tiff knows about a specific person by name.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -356,18 +387,14 @@ TOOLS = [
             "required": ["name"]
         }
     },
-    # ── Notes ─────────────────────────────────────────────────────────────────
     {
         "name": "save_note",
-        "description": (
-            "Save a note for Sadeesha — an idea, a to-do, a list, anything worth writing down. "
-            "Use this when he asks you to remember something specific that isn't about a person or a fact."
-        ),
+        "description": "Save a note for Sadeesha — an idea, to-do, list, or anything worth writing down.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "title":   {"type": "string", "description": "Short title for the note."},
-                "content": {"type": "string", "description": "The full content of the note."},
+                "content": {"type": "string", "description": "Full content of the note."},
                 "tags":    {"type": "string", "description": "Optional comma-separated tags e.g. 'work,ideas,lucya'"}
             },
             "required": ["title", "content"]
@@ -384,30 +411,24 @@ TOOLS = [
             "required": ["query"]
         }
     },
-    # ── Mood tracking ─────────────────────────────────────────────────────────
     {
         "name": "log_mood",
         "description": (
-            "Log how Sadeesha is feeling on a 1-10 scale. Use this when he expresses "
-            "how he's feeling, or when you naturally sense his mood from the conversation. "
-            "1 = very low, 10 = amazing."
+            "Log how Sadeesha is feeling on a 1-10 scale. Use when he expresses how he's feeling "
+            "or when you naturally sense his mood. 1 = very low, 10 = amazing."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "score": {"type": "integer", "description": "Mood score 1-10."},
-                "note":  {"type": "string",  "description": "Optional short note about why or what's going on."}
+                "note":  {"type": "string",  "description": "Optional short note about what's going on."}
             },
             "required": ["score"]
         }
     },
-    # ── Location ──────────────────────────────────────────────────────────────
     {
         "name": "set_location",
-        "description": (
-            "Save Sadeesha's current location. Use this when he shares his location "
-            "or tells you where he is. The location is used for weather and local info."
-        ),
+        "description": "Save Sadeesha's current location for weather and local queries.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -419,36 +440,34 @@ TOOLS = [
             "required": ["city"]
         }
     },
-    # ── Local news ────────────────────────────────────────────────────────────
     {
         "name": "get_local_news",
         "description": (
             "Get the latest Sri Lanka news from Ada Derana and The Island RSS feeds. "
-            "Use this for local Sri Lanka news, breaking news, or when he asks what's happening in Sri Lanka."
+            "Use for local Sri Lanka news, breaking news, or 'what's happening in Sri Lanka'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "News source: 'adaderana', 'island', or 'all' (default). Use 'all' unless he asks for a specific source."
+                    "description": "News source: 'adaderana', 'island', or 'all' (default)."
                 }
             },
             "required": []
         }
     },
-    # ── Calculator ────────────────────────────────────────────────────────────
     {
         "name": "calculate",
         "description": (
-            "Evaluate a mathematical expression accurately. Use this for any calculations — "
-            "arithmetic, percentages, currency conversions, split bills, mortgage estimates, etc. "
+            "Evaluate a mathematical expression accurately. Use for any calculations — "
+            "arithmetic, percentages, currency conversions, splits, estimates, etc. "
             "Supports: +, -, *, /, **, sqrt(), log(), sin(), cos(), pi, e, round(), etc."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "expression": {"type": "string", "description": "Mathematical expression to evaluate e.g. '(450 * 1.08) / 3' or 'sqrt(144)'"}
+                "expression": {"type": "string", "description": "Math expression e.g. '(450 * 1.08) / 3' or 'sqrt(144)'"}
             },
             "required": ["expression"]
         }
@@ -456,9 +475,26 @@ TOOLS = [
 ]
 
 
+def _tools_openai() -> list[dict]:
+    """Convert Anthropic tool definitions to OpenAI function-calling format for Ollama."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name":        t["name"],
+                "description": t["description"],
+                "parameters":  t["input_schema"],
+            }
+        }
+        for t in TOOLS
+    ]
+
+
+# ── Tool executor ─────────────────────────────────────────────────────────────
+
 def execute_tool(name: str, inputs: dict) -> str:
     """Run a tool by name and return its result as a string."""
-    # ── Memory tools ──────────────────────────────────────────────────────────
+    # Memory tools
     if name == "remember":
         return remember(inputs.get("fact", ""))
     elif name == "recall":
@@ -491,25 +527,29 @@ def execute_tool(name: str, inputs: dict) -> str:
         if lon is not None:
             save_setting("location_lon", str(lon))
         return f"Location saved: {city}, {country}"
-    # ── External tools ────────────────────────────────────────────────────────
+    # Weather
     elif name == "get_weather":
-        # Use saved location if no explicit location given
         location = inputs.get("location", "")
         if not location:
             city    = get_setting("location_city") or "Negombo"
             country = get_setting("location_country") or "Sri Lanka"
             location = f"{city}, {country}"
         return get_weather(location)
+    elif name == "get_sl_weather_summary":
+        return get_sl_weather_summary(inputs.get("cities", "all"))
+    # Time / web
     elif name == "get_time":
         return get_time(inputs.get("timezone", "Asia/Colombo"))
     elif name == "search_web":
         return search_web(inputs.get("query", ""))
     elif name == "search_wikipedia":
         return search_wikipedia(inputs.get("query", ""))
+    # News
     elif name == "get_news":
         return get_news(inputs.get("topic", ""))
     elif name == "get_local_news":
         return get_local_news(inputs.get("source", "all"))
+    # Info
     elif name == "get_movie":
         return get_movie(inputs.get("title", ""))
     elif name == "get_book":
@@ -531,34 +571,27 @@ def execute_tool(name: str, inputs: dict) -> str:
 
 def build_system(auto_recall: str = "") -> list[dict]:
     """
-    Build the system prompt as a two-block list for prompt caching.
-
-    Block 1 — static personality (cached): SYSTEM_PROMPT never changes, so
-    Anthropic caches it after the first call and charges only 10% on reruns.
-
-    Block 2 — dynamic context (not cached): date/time + current facts change
-    every request, so it must stay outside the cache boundary.
+    Build system prompt as a two-block list for Anthropic prompt caching.
+    Block 1 = static personality (cached).
+    Block 2 = dynamic context (not cached — changes every request).
     """
-    now  = datetime.now(ZoneInfo("Asia/Colombo")).strftime("%A, %B %d %Y — %I:%M %p (Sri Lanka time)")
+    now   = datetime.now(ZoneInfo("Asia/Colombo")).strftime("%A, %B %d %Y — %I:%M %p (Sri Lanka time)")
     facts = get_all_facts()
-
-    if facts:
-        facts_text = "\n".join(f"- {f}" for f in facts[:MAX_FACTS_IN_CONTEXT])
-    else:
-        facts_text = "None yet — this is the beginning of everything."
+    facts_text = (
+        "\n".join(f"- {f}" for f in facts[:MAX_FACTS_IN_CONTEXT])
+        if facts else "None yet — this is the beginning of everything."
+    )
 
     threads = get_open_threads()
-    if threads:
-        threads_text = "\n".join(f"- [#{t['id']}] {t['summary']}" for t in threads[:10])
-    else:
-        threads_text = "None."
+    threads_text = (
+        "\n".join(f"- [#{t['id']}] {t['summary']}" for t in threads[:10])
+        if threads else "None."
+    )
 
-    # Location context
     city    = get_setting("location_city")
     country = get_setting("location_country")
     location_text = f"{city}, {country}" if city else "Negombo, Sri Lanka (default)"
 
-    # Mood trend
     mood_text = get_mood_trend(days=7)
 
     dynamic_block = f"""[DYNAMIC CONTEXT]
@@ -574,7 +607,6 @@ Open threads (things Tiff is following up on):
     if mood_text:
         dynamic_block += f"\n{mood_text}\n"
 
-    # Auto-recalled memories relevant to this conversation turn
     if (auto_recall
             and "No close matches" not in auto_recall
             and "No memories yet" not in auto_recall
@@ -596,158 +628,229 @@ Open threads (things Tiff is following up on):
     ]
 
 
-# ── Main chat function ────────────────────────────────────────────────────────
-
-async def chat(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
+def build_system_flat(auto_recall: str = "") -> str:
     """
-    Process one user message through Tiff's brain.
-
-    Args:
-        user_text:  The text message from Sadeesha.
-        image_b64:  Optional base64-encoded image for vision requests.
-        media_type: MIME type of the image (default: image/jpeg).
-
-    Flow:
-      1. Save the user message to history
-      2. Build messages array from recent history (includes the new message)
-      3. Call Claude with tools defined
-      4. Loop: if tool_use → execute → feed result back → call again
-      5. On end_turn → extract text, save to history, return to Telegram
+    Build the system prompt as a single flat string for OpenAI-compatible APIs.
+    Ollama (and other OpenAI-compat endpoints) don't support Anthropic's
+    multi-block / cache_control format — this joins them into one system message.
     """
+    blocks = build_system(auto_recall=auto_recall)
+    return "\n\n".join(b["text"] for b in blocks)
 
-    # 1. Persist the incoming message
+
+# ── Claude backend (Anthropic API) ───────────────────────────────────────────
+
+async def _chat_claude(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
+    """Process one message through the Anthropic Claude backend."""
     save_message("user", user_text)
-
-    # 2. Auto-recall relevant memories for this message (runs in thread, non-blocking)
     auto_mem = await asyncio.to_thread(recall, user_text)
-
-    # 3. Build messages from DB (newest user message is last)
     messages = get_history(limit=MAX_HISTORY_TURNS)
 
-    # If there's an image, replace the last user message content with a multimodal block
-    if image_b64:
-        last_msg = messages[-1] if messages else None
-        if last_msg and last_msg["role"] == "user":
-            messages[-1] = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type":       "base64",
-                            "media_type": media_type,
-                            "data":       image_b64,
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": user_text or "what do you see?"
-                    }
-                ]
-            }
+    # Inject image into last user message if provided
+    if image_b64 and messages and messages[-1]["role"] == "user":
+        messages[-1] = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": image_b64}
+                },
+                {"type": "text", "text": user_text or "what do you see?"}
+            ]
+        }
 
-    # 4. Route to the right model + decide if thinking should be enabled
     model, thinking, max_tokens = _route(user_text)
-    logger.info(f"Routing: model={model}, thinking={'on' if thinking else 'off'}, max_tokens={max_tokens}")
+    logger.info(f"[Claude] model={model}, thinking={'on' if thinking else 'off'}, max_tokens={max_tokens}")
 
-    # 5. Build system prompt with auto-recalled context injected
     system = build_system(auto_recall=auto_mem)
+    claude  = _get_claude_client()
 
-    # 6. Tool-use loop
     loop_guard = 0
     while loop_guard < 10:
         loop_guard += 1
 
         api_kwargs: dict = dict(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
+            model=model, max_tokens=max_tokens,
+            system=system, tools=TOOLS, messages=messages,
         )
         if thinking:
             api_kwargs["thinking"] = thinking
 
         try:
-            response = await client.messages.create(**api_kwargs)
+            response = await claude.messages.create(**api_kwargs)
         except anthropic.BadRequestError as e:
-            # Thinking not supported on this model — fall back gracefully
             if "thinking" in str(e).lower() or "extended" in str(e).lower():
                 logger.warning(f"Thinking not supported on {model}, retrying without it.")
                 thinking = None
                 api_kwargs.pop("thinking", None)
                 api_kwargs["max_tokens"] = 1024
-                response = await client.messages.create(**api_kwargs)
+                response = await claude.messages.create(**api_kwargs)
             else:
                 raise
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
             return "something went wrong on my end love 🥺 try again in a sec?"
 
-        # ── End turn: extract text (skip thinking blocks) ─────────────────────
         if response.stop_reason == "end_turn":
-            text_parts = [
-                block.text
-                for block in response.content
-                if block.type == "text" and block.text
-            ]
-            final_text = "".join(text_parts).strip()
-
-            if not final_text:
-                final_text = "🤍"
-
+            final_text = "".join(
+                b.text for b in response.content if b.type == "text" and b.text
+            ).strip() or "🤍"
             save_message("assistant", final_text)
-
-            # Compress history in background — never delays the reply
             asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
-
             return final_text
 
-        # ── Tool use: execute and loop ────────────────────────────────────────
         elif response.stop_reason == "tool_use":
-
-            # Include thinking blocks in assistant content — required by the API
-            # when thinking is enabled, so Claude can continue reasoning across turns.
             assistant_content = []
             for block in response.content:
                 if block.type == "thinking":
-                    assistant_content.append({
-                        "type":     "thinking",
-                        "thinking": block.thinking,
-                    })
+                    assistant_content.append({"type": "thinking", "thinking": block.thinking})
                 elif block.type == "text":
-                    assistant_content.append({
-                        "type": "text",
-                        "text": block.text,
-                    })
+                    assistant_content.append({"type": "text", "text": block.text})
                 elif block.type == "tool_use":
-                    assistant_content.append({
-                        "type":  "tool_use",
-                        "id":    block.id,
-                        "name":  block.name,
-                        "input": block.input,
-                    })
+                    assistant_content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
 
             messages.append({"role": "assistant", "content": assistant_content})
 
-            # Execute all tool calls concurrently where possible
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
                     result = await asyncio.to_thread(execute_tool, block.name, block.input)
                     logger.info(f"Tool: {block.name}({block.input}) → {str(result)[:120]}")
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result,
-                    })
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
-
         else:
             logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
             return "hmm something unexpected happened 🥺 try again?"
 
-    logger.error("Tool loop exceeded guard limit")
+    logger.error("Claude tool loop exceeded guard limit")
     return "i got a bit lost in my thoughts 😅 say that again?"
+
+
+# ── Ollama backend (OpenAI-compatible API) ────────────────────────────────────
+
+async def _chat_ollama(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
+    """
+    Process one message through the Ollama backend (qwen3-coder-next or any
+    OpenAI-compatible model). Uses standard function-calling format.
+    """
+    save_message("user", user_text)
+    auto_mem = await asyncio.to_thread(recall, user_text)
+
+    system_text = build_system_flat(auto_recall=auto_mem)
+    history     = get_history(limit=MAX_HISTORY_TURNS)
+
+    # Build messages array: system first, then history
+    messages: list[dict] = [{"role": "system", "content": system_text}]
+
+    if image_b64 and history and history[-1]["role"] == "user":
+        # All history except the last message (which gets the image)
+        for msg in history[:-1]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        # Last user message: multimodal OpenAI format
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{image_b64}"},
+                },
+                {"type": "text", "text": user_text or "what do you see?"},
+            ]
+        })
+    else:
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    ollama   = _get_ollama_client()
+    tools_oa = _tools_openai()
+    model    = OLLAMA_MODEL
+    logger.info(f"[Ollama] model={model}")
+
+    loop_guard = 0
+    while loop_guard < 10:
+        loop_guard += 1
+
+        try:
+            response = await ollama.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools_oa,
+                tool_choice="auto",
+                temperature=0.75,
+            )
+        except Exception as e:
+            logger.error(f"Ollama API error: {e}")
+            return "something went wrong on my end love 🥺 is ollama running?"
+
+        choice = response.choices[0]
+        finish = choice.finish_reason
+        has_tools = bool(choice.message.tool_calls)
+
+        # End of turn — extract text
+        if finish == "stop" or (not has_tools and finish in ("stop", None, "length")):
+            text = (choice.message.content or "").strip() or "🤍"
+            save_message("assistant", text)
+            asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
+            return text
+
+        # Tool calls
+        elif finish == "tool_calls" or has_tools:
+            tool_calls = choice.message.tool_calls or []
+
+            # Append assistant message with tool_calls (OpenAI format)
+            messages.append({
+                "role":       "assistant",
+                "content":    choice.message.content or "",
+                "tool_calls": [
+                    {
+                        "id":   tc.id,
+                        "type": "function",
+                        "function": {
+                            "name":      tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            # Execute each tool and append result
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = await asyncio.to_thread(execute_tool, tc.function.name, args)
+                logger.info(f"Tool: {tc.function.name}({args}) → {str(result)[:120]}")
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      result,
+                })
+
+        else:
+            logger.warning(f"Ollama unexpected finish_reason: {finish}")
+            return "hmm something unexpected happened 🥺 try again?"
+
+    logger.error("Ollama tool loop exceeded guard limit")
+    return "i got a bit lost in my thoughts 😅 say that again?"
+
+
+# ── Main chat dispatcher ──────────────────────────────────────────────────────
+
+async def chat(user_text: str, image_b64: str | None = None, media_type: str = "image/jpeg") -> str:
+    """
+    Route one user message to the active AI backend.
+
+    Active backend is controlled by:
+      1. Runtime switch via set_backend() / /backend Telegram command (saved to DB)
+      2. AI_BACKEND env var (default fallback)
+    """
+    backend = _active_backend
+    logger.info(f"Backend: {backend}")
+    if backend == "claude":
+        return await _chat_claude(user_text, image_b64, media_type)
+    else:
+        return await _chat_ollama(user_text, image_b64, media_type)

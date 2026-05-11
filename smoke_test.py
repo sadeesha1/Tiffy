@@ -44,7 +44,7 @@ from tools import (
     get_weather, get_time, search_wikipedia, get_exchange_rate,
     get_holidays, get_definition, get_quote, search_web,
     get_book, get_movie, get_news, get_local_news, calculate,
-    get_sl_weather_summary,
+    get_sl_weather_summary, multi_search, get_youtube,
 )
 
 # ── Tools: time (local zoneinfo — no network) ─────────────────────────────────
@@ -74,9 +74,13 @@ check("get_news(cricket)",                 lambda: get_news("cricket"))
 check("get_movie(Interstellar)",           lambda: get_movie("Interstellar"))
 
 # ── Local news + calculator ───────────────────────────────────────────────────
-check("get_local_news(all)",               lambda: get_local_news("all"))
+check("get_local_news(all)",                lambda: get_local_news("all"))
 check("get_local_news(adaderana)",         lambda: get_local_news("adaderana"))
 check("get_local_news(island)",            lambda: get_local_news("island"))
+check("multi_search(all engines)",         lambda: multi_search("Sri Lanka cricket 2026"))
+check("multi_search(ddg only)",            lambda: multi_search("Python asyncio", "ddg"))
+check("get_youtube(info only)",            lambda: get_youtube("https://youtu.be/dQw4w9WgXcQ", "info"))
+check("get_youtube(transcript attempt)",   lambda: get_youtube("https://youtu.be/dQw4w9WgXcQ", "transcript"))
 check("calculate(simple)",                lambda: calculate("2 + 2"))
 check("calculate(complex)",               lambda: calculate("sqrt(144) + round(3.7)"))
 check("calculate(formula)",               lambda: calculate("(1200 * 0.18) / 12"))
@@ -93,7 +97,7 @@ check("memory.get_mood_trend()",  lambda: __import__("memory").get_mood_trend(7)
 check("brain imports",                        lambda: __import__("brain"))
 check("brain.build_system() — 2 blocks",      lambda: len(__import__("brain").build_system()) == 2)
 check("brain.build_system_flat() — string",   lambda: isinstance(__import__("brain").build_system_flat(), str))
-check("brain.TOOLS — 25 tools",               lambda: len(__import__("brain").TOOLS) == 25)
+check("brain.TOOLS — 27 tools",               lambda: len(__import__("brain").TOOLS) == 27)
 check("brain.get_backend() returns str",       lambda: __import__("brain").get_backend() in ("ollama", "claude"))
 check("brain.set_backend(ollama)",             lambda: __import__("brain").set_backend("ollama") == "ollama")
 check("brain.set_backend(claude)",             lambda: __import__("brain").set_backend("claude") == "claude")

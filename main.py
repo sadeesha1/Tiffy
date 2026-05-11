@@ -15,8 +15,10 @@ import asyncio
 import base64
 import logging
 import os
+import re
 import tempfile
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
@@ -46,35 +48,109 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ── Telegram HTML formatter ───────────────────────────────────────────────────
+
+def _fmt(text: str) -> str:
+    """
+    Convert model output (markdown-ish) to Telegram HTML.
+    Handles bold, italic, inline code, code blocks, links, and lists.
+    Falls back to plain text safely — never breaks the send call.
+    """
+    try:
+        _blocks: list[str] = []
+
+        # 1. Protect code blocks from HTML escaping
+        def _save_block(m: re.Match) -> str:
+            lang    = m.group(1) or ""
+            content = m.group(2)
+            content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            _blocks.append(f'<pre><code class="language-{lang}">{content}</code></pre>')
+            return f"\x00BLK{len(_blocks)-1}\x00"
+
+        text = re.sub(r"```(\w*)\n?(.*?)```", _save_block, text, flags=re.S)
+
+        # 2. Protect inline code
+        _inline: list[str] = []
+        def _save_inline(m: re.Match) -> str:
+            c = m.group(1).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            _inline.append(f"<code>{c}</code>")
+            return f"\x00INL{len(_inline)-1}\x00"
+
+        text = re.sub(r"`([^`\n]+)`", _save_inline, text)
+
+        # 3. Escape HTML in remaining plain text
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # 4. Bold: **text** or __text__
+        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"__(.+?)__",     r"<b>\1</b>", text)
+
+        # 5. Italic: *text* (only single *) — skip _ to avoid emoji issues
+        text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+
+        # 6. Strikethrough: ~~text~~
+        text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+        # 7. Links: [text](url)
+        text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', text)
+
+        # 8. Restore placeholders
+        for i, repl in enumerate(_inline):
+            text = text.replace(f"\x00INL{i}\x00", repl)
+        for i, repl in enumerate(_blocks):
+            text = text.replace(f"\x00BLK{i}\x00", repl)
+
+        return text
+
+    except Exception:
+        # Never fail a message send due to formatting
+        return text
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 TELEGRAM_MAX = 4096
 
 async def safe_reply(update: Update, text: str):
     """
-    Send a reply, splitting on Telegram's 4096-char limit and retrying
-    once on transient timeouts / network errors.
+    Send a reply with Telegram HTML formatting, splitting on the 4096-char limit
+    and retrying once on transient timeouts / network errors.
+    Falls back to plain text if HTML parse fails.
     """
-    # Split into chunks if needed
-    chunks = [text[i:i + TELEGRAM_MAX] for i in range(0, len(text), TELEGRAM_MAX)]
+    formatted = _fmt(text)
+    chunks = [formatted[i:i + TELEGRAM_MAX] for i in range(0, len(formatted), TELEGRAM_MAX)]
     for chunk in chunks:
         for attempt in range(2):
             try:
-                await update.message.reply_text(chunk)
+                await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
                 break
-            except (TimedOut, NetworkError) as e:
-                if attempt == 0:
+            except Exception as e:
+                err_str = str(e).lower()
+                if "can't parse entities" in err_str or "html" in err_str:
+                    # HTML parse error — fall back to plain text for this chunk
+                    logger.warning(f"HTML parse failed, sending plain text: {e}")
+                    try:
+                        plain = text[
+                            (chunks.index(chunk) * TELEGRAM_MAX) :
+                            (chunks.index(chunk) + 1) * TELEGRAM_MAX
+                        ]
+                        await update.message.reply_text(plain)
+                    except Exception:
+                        pass
+                    break
+                elif isinstance(e, (TimedOut, NetworkError)) and attempt == 0:
                     logger.warning(f"Telegram send failed ({e}), retrying in 3s…")
                     await asyncio.sleep(3)
                 else:
                     logger.error(f"Telegram send failed after retry: {e}")
-                    # Last-ditch: send a short fallback so the user isn't left hanging
                     try:
                         await update.message.reply_text(
                             "sorry, i had a little network hiccup 🥺 say that again?"
                         )
                     except Exception:
                         pass
+                    break
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

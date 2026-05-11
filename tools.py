@@ -454,6 +454,127 @@ def get_sl_weather_summary(cities: str = "all") -> str:
     return "\n".join(lines)
 
 
+# ── YouTube ───────────────────────────────────────────────────────────────────
+
+def get_youtube(url: str, what: str = "all") -> str:
+    """
+    Fetch YouTube video info and/or transcript.
+    what: "info" | "transcript" | "all"
+    Works with any video that has CC or auto-generated subtitles.
+    """
+    import re
+
+    # Extract video ID from any YouTube URL form
+    vid_match = re.search(
+        r'(?:v=|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})', url
+    )
+    if not vid_match:
+        return f"Couldn't parse a video ID from: {url}"
+    vid_id = vid_match.group(1)
+    video_url = f"https://youtu.be/{vid_id}"
+
+    parts: list[str] = []
+
+    # ── Metadata via YouTube oEmbed (free, no key) ────────────────────────────
+    if what in ("info", "all"):
+        meta = _get(f"https://www.youtube.com/oembed?url={video_url}&format=json")
+        if meta:
+            parts.append(
+                f"Title:   {meta.get('title', 'Unknown')}\n"
+                f"Channel: {meta.get('author_name', 'Unknown')}\n"
+                f"URL:     {video_url}"
+            )
+        else:
+            parts.append(f"URL: {video_url}")
+
+    # ── Transcript via youtube-transcript-api (no key, v0.6+ API) ───────────────
+    if what in ("transcript", "all"):
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            api = YouTubeTranscriptApi()
+
+            # Try English first, fall back to any available transcript
+            try:
+                transcript_obj = api.fetch(vid_id, languages=["en", "en-US", "en-GB", "en-AU"])
+            except Exception:
+                # List available and grab the first one
+                listings = api.list(vid_id)
+                transcript_obj = next(iter(listings)).fetch()
+
+            segs = list(transcript_obj)
+            text = " ".join(s.get("text", "") if isinstance(s, dict) else str(s.text) for s in segs)
+            if len(text) > 4000:
+                text = text[:4000] + "… [transcript truncated]"
+            parts.append(f"\nTranscript ({len(segs)} segments):\n{text}")
+
+        except Exception as e:
+            parts.append(f"\nTranscript unavailable: {e}")
+
+    return "\n".join(parts) if parts else "No information found for this video."
+
+
+# ── Multi-engine search ───────────────────────────────────────────────────────
+
+_SEARX_INSTANCES = [
+    "https://searx.be",
+    "https://search.sapti.me",
+    "https://searx.tiekoetter.com",
+    "https://searxng.world",
+]
+
+
+def multi_search(query: str, engines: str = "all") -> str:
+    """
+    Multi-engine web search — aggregates DuckDuckGo + SearXNG (which itself
+    queries Google, Bing, Brave, and others). No API keys needed.
+    engines: "ddg" | "searx" | "all"
+    """
+    results: list[str] = []
+
+    # ── DDG ───────────────────────────────────────────────────────────────────
+    if engines in ("ddg", "all"):
+        ddg = search_web(query)
+        if ddg and "No results" not in ddg and "unavailable" not in ddg:
+            results.append(f"[DuckDuckGo]\n{ddg}")
+
+    # ── SearXNG (public JSON API — aggregates Google, Bing, Brave, etc.) ─────
+    if engines in ("searx", "all"):
+        for instance in _SEARX_INSTANCES:
+            try:
+                r = httpx.get(
+                    f"{instance}/search",
+                    params={
+                        "q": query,
+                        "format": "json",
+                        "engines": "google,bing,duckduckgo,brave",
+                    },
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=TIMEOUT,
+                    follow_redirects=True,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    hits = data.get("results", [])[:6]
+                    if hits:
+                        lines = []
+                        for h in hits:
+                            title   = h.get("title", "").strip()
+                            snippet = h.get("content", "").strip()[:200]
+                            engine  = h.get("engine", "")
+                            if title:
+                                lines.append(f"• {title}  [{engine}]\n  {snippet}")
+                        if lines:
+                            results.append(f"[SearXNG via {instance}]\n" + "\n\n".join(lines))
+                            break  # got results — no need to try next instance
+            except Exception:
+                continue
+
+    if not results:
+        return f"No results found for '{query}'."
+
+    return "\n\n━━━━━━━━━━\n\n".join(results)
+
+
 # ── Calculator ────────────────────────────────────────────────────────────────
 
 def calculate(expression: str) -> str:

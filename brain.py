@@ -37,7 +37,7 @@ from tools import (
     get_weather, get_sl_weather_summary, get_time, search_web, search_wikipedia,
     get_news, get_movie, get_book, get_definition,
     get_holidays, get_quote, get_exchange_rate,
-    get_local_news, calculate,
+    get_local_news, calculate, get_youtube, multi_search,
 )
 from prompt import SYSTEM_PROMPT
 
@@ -478,6 +478,45 @@ TOOLS = [
         }
     },
     {
+        "name": "get_youtube",
+        "description": (
+            "Fetch YouTube video information and/or transcript. Use this when Sadeesha "
+            "shares a YouTube link and wants a summary, wants to know what a video is about, "
+            "or asks questions about video content. Pass the full URL."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url":  {"type": "string", "description": "Full YouTube video URL e.g. https://youtu.be/abc123"},
+                "what": {
+                    "type": "string",
+                    "description": "'info' for title/channel only, 'transcript' for full text, 'all' for both (default: 'all')"
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "multi_search",
+        "description": (
+            "Multi-engine web search that queries DuckDuckGo AND SearXNG (which aggregates "
+            "Google, Bing, Brave and others) for richer results. Use this when search_web "
+            "returns weak results, when Sadeesha wants thorough research, or for complex "
+            "queries where multiple perspectives help."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":   {"type": "string", "description": "Search query"},
+                "engines": {
+                    "type": "string",
+                    "description": "'ddg' for DuckDuckGo only, 'searx' for SearXNG only, 'all' for both (default: 'all')"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "calculate",
         "description": (
             "Evaluate a mathematical expression accurately. Use for any calculations — "
@@ -584,6 +623,10 @@ def execute_tool(name: str, inputs: dict) -> str:
         return get_exchange_rate(inputs.get("from_currency", "USD"), inputs.get("to_currency", "LKR"))
     elif name == "calculate":
         return calculate(inputs.get("expression", ""))
+    elif name == "get_youtube":
+        return get_youtube(inputs.get("url", ""), inputs.get("what", "all"))
+    elif name == "multi_search":
+        return multi_search(inputs.get("query", ""), inputs.get("engines", "all"))
     return f"Unknown tool: {name}"
 
 

@@ -212,8 +212,42 @@ def remember(content: str) -> str:
         return f"Couldn't remember that: {e}"
 
 
+def _recall_text_fallback(query: str) -> str:
+    """
+    Simple SQLite keyword search — used when Qdrant is unavailable.
+    Splits query into keywords and returns facts that match any of them.
+    """
+    try:
+        keywords = [w for w in query.lower().split() if len(w) > 3][:5]
+        if not keywords:
+            facts = get_all_facts()
+            return "\n".join(facts[:5]) if facts else ""
+
+        with sqlite3.connect(DB_PATH) as conn:
+            results = set()
+            for kw in keywords:
+                rows = conn.execute(
+                    "SELECT content FROM facts WHERE LOWER(content) LIKE ? ORDER BY id DESC LIMIT 5",
+                    (f"%{kw}%",)
+                ).fetchall()
+                for r in rows:
+                    results.add(r[0])
+
+        if results:
+            return "\n".join(list(results)[:8])
+
+        # Last resort: most recent facts
+        facts = get_all_facts()
+        return "\n".join(facts[:5]) if facts else ""
+    except Exception:
+        return ""
+
+
 def recall(query: str) -> str:
-    """Semantic search over long-term memory using vector similarity."""
+    """
+    Semantic search over long-term memory using vector similarity.
+    Falls back to SQLite keyword search if Qdrant is unavailable.
+    """
     try:
         q_vec = next(_get_embedder().embed([query])).tolist()
         hits = _get_qdrant().search(
@@ -225,13 +259,15 @@ def recall(query: str) -> str:
         if hits:
             return "\n".join(h.payload["content"] for h in hits)
 
-        # Fallback: most recent facts
+        # Vector search returned nothing — try recent facts
         recent = get_all_facts()
         if not recent:
-            return "No memories yet."
-        return "No close matches. Recent facts:\n" + "\n".join(recent[:5])
+            return ""
+        return "\n".join(recent[:5])
+
     except Exception as e:
-        return f"Couldn't search memory: {e}"
+        logger.warning(f"Vector recall failed ({type(e).__name__}), using text fallback")
+        return _recall_text_fallback(query)
 
 
 def get_all_facts() -> list[str]:
@@ -549,25 +585,47 @@ def maybe_summarise_history() -> bool:
         f"{role.upper()}: {content[:300]}" for role, content in old_rows
     )
 
+    prompt_msg = (
+        "Summarise this older portion of a conversation between Tiff (AI companion) "
+        "and Sadeesha. Write 3-5 concise sentences covering key topics, decisions, "
+        "mood, anything worth remembering. Third person, factual, brief.\n\n"
+        f"TRANSCRIPT:\n{transcript}"
+    )
+
     try:
-        import anthropic
-        from config import ANTHROPIC_API_KEY, FAST_MODEL
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model=FAST_MODEL,
-            max_tokens=512,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "You are summarising an older portion of a conversation between "
-                    "Tiff (an AI companion) and Sadeesha. Write a concise 3-5 sentence "
-                    "summary of what was discussed — key topics, decisions, mood, anything "
-                    "worth remembering. Write in third person. Be factual and brief.\n\n"
-                    f"TRANSCRIPT:\n{transcript}"
-                )
-            }]
-        )
-        summary_text = resp.content[0].text.strip()
+        from config import AI_BACKEND, ANTHROPIC_API_KEY, FAST_MODEL
+        from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_API_KEY
+
+        # Use the active backend setting from DB (runtime override) or env default
+        with sqlite3.connect(DB_PATH) as _c:
+            _row = _c.execute("SELECT value FROM settings WHERE key='ai_backend'").fetchone()
+        active_backend = (_row[0] if _row else None) or AI_BACKEND
+
+        if active_backend == "claude" and ANTHROPIC_API_KEY:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            resp = client.messages.create(
+                model=FAST_MODEL,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt_msg}]
+            )
+            summary_text = resp.content[0].text.strip()
+        else:
+            # Ollama (or Claude key missing) — use OpenAI-compatible client
+            import os
+            from openai import OpenAI
+            base_url = os.getenv("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
+            api_key  = os.getenv("OLLAMA_API_KEY",  OLLAMA_API_KEY) or "ollama"
+            model    = os.getenv("OLLAMA_MODEL",    OLLAMA_MODEL)
+            client   = OpenAI(base_url=base_url, api_key=api_key)
+            resp = client.chat.completions.create(
+                model=model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt_msg}],
+                temperature=0.3,
+            )
+            summary_text = resp.choices[0].message.content.strip()
+
     except Exception as e:
         logger.warning(f"History summarisation failed: {e}")
         return False
@@ -734,27 +792,33 @@ def capture_learning(category: str, content: str) -> str:
 
 
 def _promote_learning_by_id(learning_id: int, content: str):
-    """Promote a learning to core facts table (and vector index)."""
+    """
+    Promote a learning to core facts table.
+    SQLite write always happens. Vector indexing is best-effort — if Qdrant
+    is locked, the fact is still saved and will be picked up by _sync_missing_facts
+    on the next startup.
+    """
     try:
-        # Add to facts
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.execute("INSERT INTO facts (content) VALUES (?)", (content,))
             new_id = cursor.lastrowid
             conn.execute("UPDATE learnings SET promoted=1 WHERE id=?", (learning_id,))
             conn.commit()
-        # Index in Qdrant
-        try:
-            from qdrant_client import models as qm
-            vector = next(_get_embedder().embed([content])).tolist()
-            _get_qdrant().upsert(
-                collection_name=COLLECTION,
-                points=[qm.PointStruct(id=new_id, vector=vector, payload={"content": content})],
-            )
-        except Exception:
-            pass
-        logger.info(f"Learning promoted to fact: {content[:60]}")
+        logger.info(f"Learning promoted to fact (id={new_id}): {content[:60]}")
     except Exception as e:
-        logger.warning(f"Learning promotion failed: {e}")
+        logger.warning(f"Learning promotion (SQLite) failed: {e}")
+        return
+
+    # Vector indexing — best-effort, don't block on Qdrant errors
+    try:
+        from qdrant_client import models as qm
+        vector = next(_get_embedder().embed([content])).tolist()
+        _get_qdrant().upsert(
+            collection_name=COLLECTION,
+            points=[qm.PointStruct(id=new_id, vector=vector, payload={"content": content})],
+        )
+    except Exception as e:
+        logger.warning(f"Vector index for promoted fact deferred (Qdrant busy): {e}")
 
 
 def get_learnings(category: str | None = None, limit: int = 30) -> list[dict]:

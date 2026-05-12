@@ -147,6 +147,27 @@ def _is_complex_query(text: str) -> bool:
     return any(kw in tl for kw in _COMPLEX_KEYWORDS)
 
 
+_CJK_RE = __import__("re").compile(
+    r"[一-鿿"    # CJK Unified Ideographs
+    r"㐀-䶿"     # CJK Extension A
+    r"　-〿"     # CJK Symbols & Punctuation
+    r"＀-￯]+"   # Fullwidth / Halfwidth Forms
+)
+
+
+def _clean_response(text: str) -> str:
+    """
+    Strip CJK characters that occasionally leak from Chinese-origin models
+    (qwen3 etc.) into otherwise English responses.
+    Only removes the CJK chars themselves — leaves surrounding text intact.
+    """
+    cleaned = _CJK_RE.sub("", text)
+    # Collapse any double-spaces left behind
+    import re as _re
+    cleaned = _re.sub(r"  +", " ", cleaned)
+    return cleaned.strip()
+
+
 def _process_user_signals(text: str):
     """
     Extract self-learning signals from a user message and save them.
@@ -757,9 +778,10 @@ async def _chat_claude(user_text: str, image_b64: str | None = None, media_type:
             return "something went wrong on my end love 🥺 try again in a sec?"
 
         if response.stop_reason == "end_turn":
-            final_text = "".join(
+            raw = "".join(
                 b.text for b in response.content if b.type == "text" and b.text
-            ).strip() or "🤍"
+            ).strip()
+            final_text = _clean_response(raw) or "🤍"
             save_message("assistant", final_text)
             asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
             return final_text
@@ -865,7 +887,7 @@ async def _chat_ollama(user_text: str, image_b64: str | None = None, media_type:
 
         # End of turn — extract text
         if finish == "stop" or (not has_tools and finish in ("stop", None, "length")):
-            text = (choice.message.content or "").strip() or "🤍"
+            text = _clean_response(choice.message.content or "") or "🤍"
             save_message("assistant", text)
             asyncio.create_task(asyncio.to_thread(maybe_summarise_history))
             return text

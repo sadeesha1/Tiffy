@@ -159,11 +159,29 @@ def _clean_response(text: str) -> str:
     """
     Strip CJK characters that occasionally leak from Chinese-origin models
     (qwen3 etc.) into otherwise English responses.
-    Only removes the CJK chars themselves — leaves surrounding text intact.
+    Also collapse poem-style excessive line breaks — 3+ newlines → 2,
+    and 2+ newlines between short fragments → single newline.
     """
     cleaned = _CJK_RE.sub("", text)
-    # Collapse any double-spaces left behind
     import re as _re
+    # Collapse 3+ consecutive newlines to 2 (one blank line max)
+    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned)
+    # If lines are very short (≤40 chars) and separated by a single newline,
+    # join them into flowing prose — this fixes the "poem" style from qwen3
+    lines = cleaned.split("\n")
+    merged: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if (merged and stripped
+                and len(stripped) <= 60
+                and not stripped.startswith(("•", "-", "*", "#", "1", "2", "3", "4", "5"))
+                and merged[-1] != ""
+                and len(merged[-1]) <= 60):
+            merged[-1] = merged[-1].rstrip() + " " + stripped
+        else:
+            merged.append(line)
+    cleaned = "\n".join(merged)
+    # Collapse any double-spaces left behind
     cleaned = _re.sub(r"  +", " ", cleaned)
     return cleaned.strip()
 
